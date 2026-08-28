@@ -7,6 +7,10 @@
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)]()
 [![License](https://img.shields.io/badge/License-Non--Commercial-red.svg)]()
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="音效管理主界面截图" width="850">
+</p>
+
 ---
 
 > ### ⚠️ 【重要免责与非商用声明】
