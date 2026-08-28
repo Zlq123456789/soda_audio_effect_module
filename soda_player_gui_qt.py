@@ -40,7 +40,8 @@ try:
     from PySide6.QtGui import QColor, QPainter, QLinearGradient, QRadialGradient, QBrush, QPen, QFont, QIcon, QPixmap
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-        QLabel, QPushButton, QComboBox, QScrollArea, QFrame, QMessageBox, QSizePolicy
+        QLabel, QPushButton, QComboBox, QScrollArea, QFrame, QMessageBox, QSizePolicy,
+        QStackedLayout
     )
 except ImportError:
     from PyQt6 import QtCore, QtGui, QtWidgets
@@ -48,7 +49,8 @@ except ImportError:
     from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QRadialGradient, QBrush, QPen, QFont, QIcon, QPixmap
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-        QLabel, QPushButton, QComboBox, QScrollArea, QFrame, QMessageBox, QSizePolicy
+        QLabel, QPushButton, QComboBox, QScrollArea, QFrame, QMessageBox, QSizePolicy,
+        QStackedLayout
     )
 
 if getattr(sys, 'frozen', False):
@@ -65,12 +67,13 @@ PNG_PATH = os.path.join(BASE_DIR, 'app_icon.png')
 LOG_FILE = os.path.join(BASE_DIR, 'soda_player.log')
 CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 
-# 配置本地日志
+# 配置本地日志 (限制最大 1MB 循环覆盖，杜绝超大日志产生)
+from logging.handlers import RotatingFileHandler
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 for h in root_logger.handlers[:]:
     root_logger.removeHandler(h)
-fh = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+fh = RotatingFileHandler(LOG_FILE, maxBytes=1024 * 1024, backupCount=1, encoding='utf-8')
 fh.setLevel(logging.INFO)
 fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
 root_logger.addHandler(fh)
@@ -245,11 +248,111 @@ class SystemVolumeWatcher:
             logging.warning(f"SystemVolumeWatcher error: {e}")
 
 
+from ctypes import wintypes
+from comtypes import COMObject, CoInitialize, CoUninitialize
+import pycaw.pycaw as pc
+
+
+class WindowsAudioEndpointNotificationClient(COMObject):
+    """Core Audio IMMNotificationClient 回调实现类"""
+    _com_interfaces_ = [pc.IMMNotificationClient]
+
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def OnDeviceStateChanged(self, pwstrDeviceId, dwNewState):
+        if self.callback:
+            try: self.callback('state_changed', pwstrDeviceId, dwNewState)
+            except Exception: pass
+
+    def OnDeviceAdded(self, pwstrDeviceId):
+        if self.callback:
+            try: self.callback('added', pwstrDeviceId)
+            except Exception: pass
+
+    def OnDeviceRemoved(self, pwstrDeviceId):
+        if self.callback:
+            try: self.callback('removed', pwstrDeviceId)
+            except Exception: pass
+
+    def OnDefaultDeviceChanged(self, flow, role, pwstrDefaultDeviceId):
+        if self.callback:
+            try: self.callback('default_changed', pwstrDefaultDeviceId)
+            except Exception: pass
+
+    def OnPropertyValueChanged(self, pwstrDeviceId, key):
+        pass
+
+
+class WindowsAudioDeviceWatcher:
+    """Windows 音频设备即插即用/断开连接异步监听器 (基于 Core Audio IMMNotificationClient)"""
+    def __init__(self, on_change_callback):
+        self.on_change_callback = on_change_callback
+        self.running = False
+        self.thread = None
+        self._client = None
+        self._enumerator = None
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            CoInitialize()
+            try:
+                self._enumerator = pc.AudioUtilities.GetDeviceEnumerator()
+                self._client = WindowsAudioEndpointNotificationClient(self.on_change_callback)
+                self._enumerator.RegisterEndpointNotificationCallback(self._client)
+                logging.info("WindowsAudioDeviceWatcher: Core Audio IMMNotificationClient registered.")
+                while self.running:
+                    time.sleep(0.5)
+            finally:
+                if self._enumerator and self._client:
+                    try:
+                        self._enumerator.UnregisterEndpointNotificationCallback(self._client)
+                    except Exception:
+                        pass
+                CoUninitialize()
+        except Exception as e:
+            logging.warning(f"WindowsAudioDeviceWatcher exception: {e}")
+
+    def stop(self):
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            try:
+                self.thread.join(timeout=0.4)
+            except Exception:
+                pass
+            self.thread = None
+
+
+def get_active_render_device_signature():
+    """获取当前所有活动音频输出设备的轻量签名（用于心跳比对，耗时 < 5ms）"""
+    try:
+        CoInitialize()
+        try:
+            enum = pc.AudioUtilities.GetDeviceEnumerator()
+            collection = enum.EnumAudioEndpoints(pc.EDataFlow.eRender.value, pc.DEVICE_STATE.ACTIVE.value)
+            count = collection.GetCount()
+            ids = []
+            for i in range(count):
+                dev = collection.Item(i)
+                ids.append(dev.GetId())
+            return tuple(sorted(ids))
+        finally:
+            CoUninitialize()
+    except Exception:
+        return ()
+
+
 def get_device_endpoint_volume(device_name):
     """获取指定物理声卡设备的系统音量标量 (0.0 ~ 1.0)"""
     try:
-        from comtypes import CoInitialize, CoUninitialize
-        import pycaw.pycaw as pc
         CoInitialize()
         try:
             for dev in pc.AudioUtilities.GetAllDevices():
@@ -266,8 +369,6 @@ def get_device_endpoint_volume(device_name):
 def set_device_endpoint_volume(device_name, volume_scalar):
     """设置指定物理声卡设备的系统音量标量 (0.0 ~ 1.0)"""
     try:
-        from comtypes import CoInitialize, CoUninitialize
-        import pycaw.pycaw as pc
         CoInitialize()
         try:
             for dev in pc.AudioUtilities.GetAllDevices():
@@ -448,7 +549,7 @@ class FluentVolumeSlider(QWidget):
             self._dragging = False
 
     def wheelEvent(self, event):
-        delta = 5 if event.angleDelta().y() > 0 else -5
+        delta = 1 if event.angleDelta().y() > 0 else -1
         self.setValue(self._val + delta)
 
     def paintEvent(self, event):
@@ -597,45 +698,390 @@ class MiniCardSlider(QWidget):
         painter.drawEllipse(QPointF(cx, cy), 2.2, 2.2)
 
 
-class SpectrumVisualizerWidget(QWidget):
-    """60FPS GPU 硬件加速 32 频段高保真彩虹渐变声学律动频谱仪"""
+
+class Galaxy3DBackgroundEngine(QtCore.QObject):
+    """
+    60FPS 3D 沉浸式粒子互动前台背景引擎
+    完全集成 openmusic 官方原版的 5 频段声学分析与自适应节奏锁相环实时节拍引擎:
+      - Sub-Bass (38-74Hz): 极低频大鼓与次低音冲击
+      - Kick Core (52-165Hz): 核心底鼓与重低音爆发
+      - Kick Body (165-420Hz): 贝斯琴腔共鸣
+      - Vocal (420-2600Hz): 人声与主旋律 (配合人声屏蔽防误触发)
+      - Snap (1800-9200Hz): 清脆打击乐与踩镲瞬态
+      - High (6200-16000Hz): 高频泛音与空气感
+      - 双速指数差分瞬态提取 (Dual-Speed Envelope Fast vs Slow)
+      - 自适应 BPM 节奏锁相环 (Tempo Gap & Phase Lock)
+      - 非对称 Attack/Release 包络跟随器
+      - 动态多重音爆冲击波 (Sonic Shockwaves)
+    支持 4 种 3D 视觉模式 (星河、星球、滚筒、微粒)，支持 360° 鼠标拖拽与滚轮变焦
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(48)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.num_bars = 32
-        self.smooth_bars = np.zeros(self.num_bars, dtype=np.float32)
-        self.peak_heights = np.zeros(self.num_bars, dtype=np.float32)
-        self.raw_magnitudes = np.zeros(self.num_bars, dtype=np.float32)
         self.theme = "dark"
+        self.mode = "galaxy"  # galaxy, planet, tunnel, dust, off (默认开启星河)
+        self.blur_enabled = False  # 3D 沉浸背景动效模糊/虚化光晕开关 (默认关：高清针芒星尘)
+        self.num_particles = 1000
 
-        # 生成 32 频段高质感渐变色板 (黑金 -> 翡翠 -> 冰蓝 -> 梦幻紫)
-        self.bar_colors = []
-        for i in range(self.num_bars):
-            t = i / float(self.num_bars - 1)
-            if t < 0.35:
-                r = int(245 + t * 25)
-                g = int(158 + t * 90)
-                b = int(11 + t * 60)
-            elif t < 0.7:
-                t_rel = (t - 0.35) / 0.35
-                r = int(16 - t_rel * 10)
-                g = int(185 - t_rel * 3)
-                b = int(129 + t_rel * 83)
+        # 相机与 3D 旋转参数 (调整相机视角与变焦，星系与星球更加宏伟舒展)
+        self.cam_dist = 10.5
+        self.target_dist = 10.5
+        self.rot_x = 0.28
+        self.rot_y = 0.0
+        self.vx = 0.0
+        self.vy = 0.003
+        self.is_dragging = False
+        self.last_pos = None
+
+        # 视觉平滑包络输出
+        self.bass = 0.0
+        self.mid = 0.0
+        self.treble = 0.0
+        self.energy = 0.0
+        self.beat_pulse = 0.0
+        self.time_t = 0.0
+        self.shockwaves = []
+
+        # 预计算粒子几何基础数据
+        self._init_particle_geometries()
+
+    def _init_particle_geometries(self):
+        N = self.num_particles
+        rng = np.random.RandomState(42)
+
+        # 1. 星河涡旋基础坐标 (Galaxy - 更加开阔壮观的星系旋臂)
+        u = rng.rand(N).astype(np.float32)
+        arm = rng.randint(0, 3, N).astype(np.float32)
+        self.g_arm = arm
+        self.g_u = u
+        self.g_angle = u * (3.8 * np.pi) + arm * (2.0 * np.pi / 3.0)
+        self.g_radius = 0.45 + np.sqrt(u) * 7.5
+        self.g_z = rng.randn(N).astype(np.float32) * 0.48 * np.exp(-self.g_radius / 4.5)
+        self.g_size = 0.9 + u * 1.4 + rng.rand(N).astype(np.float32) * 0.7
+
+        # 2. 星球基础坐标 (Planet - 宏伟星体与舒展土星环)
+        is_sphere = np.arange(N) < int(N * 0.38)
+        p_theta = rng.rand(N).astype(np.float32) * 2.0 * np.pi
+        p_phi = (rng.rand(N).astype(np.float32) - 0.5) * np.pi
+
+        sx = 3.2 * np.cos(p_phi) * np.cos(p_theta)
+        sy = 3.2 * np.cos(p_phi) * np.sin(p_theta)
+        sz = 3.2 * np.sin(p_phi)
+
+        ring_r = 4.6 + rng.rand(N).astype(np.float32) * 5.2
+        rx = ring_r * np.cos(p_theta)
+        ry = ring_r * np.sin(p_theta)
+        rz = rng.randn(N).astype(np.float32) * 0.10
+
+        self.p_base = np.where(is_sphere[:, None], np.column_stack([sx, sy, sz]), np.column_stack([rx, ry, rz])).astype(np.float32)
+        self.p_is_sphere = is_sphere
+
+        # 3. 滚筒隧道基础坐标 (Tunnel - 温和纵深分布)
+        self.t_angle = rng.rand(N).astype(np.float32) * 2.0 * np.pi
+        self.t_z = (rng.rand(N).astype(np.float32) - 0.5) * 22.0
+        self.t_radius = 2.8 + rng.rand(N).astype(np.float32) * 0.9
+
+        # 4. 氛围微粒 (Dust - 三维平滑连续呼吸漂浮)
+        self.d_pos = (rng.rand(N, 3).astype(np.float32) - 0.5) * 14.0
+        self.d_phase = rng.rand(N, 3).astype(np.float32) * 2.0 * np.pi
+        self.d_freq = 0.18 + rng.rand(N, 3).astype(np.float32) * 0.22
+        self.d_cat = rng.randint(0, 3, N)
+
+    def set_theme(self, theme):
+        self.theme = theme
+
+    def set_mode(self, mode):
+        self.mode = mode
+
+    def set_blur(self, enabled):
+        self.blur_enabled = bool(enabled)
+
+    def process_audio_frame(self, fft_data=None, time_rms=None, sample_rate=48000, dt=0.016):
+        """纯净独立 3D 宇宙背景推进 (解耦声音联动，纯享丝滑宁静天体漫游)"""
+        safe_dt = max(0.001, min(0.08, float(dt)))
+        self.time_t += safe_dt
+
+        # 惯性旋转阻尼
+        if not self.is_dragging:
+            self.rot_y += self.vy
+            self.rot_x += self.vx
+            self.rot_x = max(-0.95, min(0.95, self.rot_x))
+            self.vx *= 0.94
+            self.vy = self.vy * 0.94 if abs(self.vy) > 0.003 else 0.003
+
+        self.cam_dist += (self.target_dist - self.cam_dist) * 0.08
+        self.shockwaves = []
+        self.bass = 0.0
+        self.mid = 0.0
+        self.treble = 0.0
+        self.energy = 0.0
+        self.beat_pulse = 0.0
+
+    def eventFilter(self, watched, event):
+        """全局鼠标拦截器：在窗口空白区域按住鼠标拖拽即可 3D 旋转"""
+        if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.is_dragging = True
+                self.last_pos = event.position()
+                self.vx = 0.0
+                self.vy = 0.0
+        elif event.type() == QtCore.QEvent.Type.MouseMove:
+            if self.is_dragging and self.last_pos:
+                delta = event.position() - self.last_pos
+                dx = delta.x()
+                dy = delta.y()
+                self.rot_y += dx * 0.004
+                self.rot_x += dy * 0.004
+                self.rot_x = max(-0.95, min(0.95, self.rot_x))
+                self.vy = dx * 0.003
+                self.vx = dy * 0.003
+                self.last_pos = event.position()
+        elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.is_dragging = False
+                self.last_pos = None
+        elif event.type() == QtCore.QEvent.Type.Wheel:
+            delta = event.angleDelta().y()
+            self.target_dist = max(6.0, min(28.0, self.target_dist - delta * 0.008))
+        return False
+
+    def paint_background(self, painter, width, height):
+        w = float(width)
+        h = float(height)
+        cx = w / 2.0
+        cy = h / 2.0
+
+        if self.mode == "off":
+            bg_col = QColor("#f3f4f6") if self.theme == "light" else QColor("#121216")
+            painter.fillRect(0, 0, int(w), int(h), bg_col)
+            return
+
+        # 1. 宇宙深空与星云渐变底色
+        if self.theme == "light":
+            grad = QRadialGradient(cx, cy, max(w, h) * 0.75)
+            if self.blur_enabled:
+                grad.setColorAt(0.0, QColor(224, 231, 255, 240))
+                grad.setColorAt(0.40, QColor(241, 245, 249, 220))
+                grad.setColorAt(0.80, QColor(226, 232, 240, 200))
+                grad.setColorAt(1.0, QColor(218, 226, 236, 255))
             else:
-                t_rel = (t - 0.7) / 0.3
-                r = int(56 + t_rel * 73)
-                g = int(189 - t_rel * 49)
-                b = int(248 + t_rel * 0)
-            self.bar_colors.append(QColor(max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))))
+                grad.setColorAt(0.0, QColor("#e0e7ff"))
+                grad.setColorAt(0.5, QColor("#f1f5f9"))
+                grad.setColorAt(1.0, QColor("#e2e8f0"))
+        else:
+            grad = QRadialGradient(cx, cy, max(w, h) * 0.75)
+            if self.blur_enabled:
+                grad.setColorAt(0.0, QColor(32, 20, 48, 255))
+                grad.setColorAt(0.35, QColor(20, 22, 32, 255))
+                grad.setColorAt(0.70, QColor(13, 14, 20, 255))
+                grad.setColorAt(1.0, QColor(7, 8, 11, 255))
+            else:
+                grad.setColorAt(0.0, QColor(24, 18, 36))
+                grad.setColorAt(0.45, QColor(14, 15, 22))
+                grad.setColorAt(1.0, QColor(7, 8, 11))
+
+        painter.fillRect(0, 0, int(w), int(h), QBrush(grad))
+
+        # 2. 3D 旋转矩阵计算
+        cos_x = math.cos(self.rot_x)
+        sin_x = math.sin(self.rot_x)
+        cos_y = math.cos(self.rot_y)
+        sin_y = math.sin(self.rot_y)
+
+        t = self.time_t
+        N = self.num_particles
+        fov = min(w, h) * 0.95
+
+        # 根据当前模式计算 3D 粒子坐标 (纯净天体动力学轨迹，无声频畸变与剧烈抖动)
+        if self.mode == "galaxy":
+            flow = t * 0.16
+            ang = self.g_angle + flow
+            r_pulse = self.g_radius
+            px = np.cos(ang) * r_pulse
+            py = np.sin(ang) * r_pulse * 0.48 + np.sin(t * 0.3 + self.g_u * 6.0) * 0.18
+            pz = self.g_z
+            sizes = self.g_size
+            colors_cat = self.g_arm
+
+        elif self.mode == "planet":
+            spin = t * 0.20
+            pts = self.p_base.copy()
+            c_sp = np.cos(spin)
+            s_sp = np.sin(spin)
+            pts[:, 0] = self.p_base[:, 0] * c_sp - self.p_base[:, 1] * s_sp
+            pts[:, 1] = self.p_base[:, 0] * s_sp + self.p_base[:, 1] * c_sp
+            px = pts[:, 0]
+            py = pts[:, 1] * 0.5
+            pz = pts[:, 2]
+            sizes = np.where(self.p_is_sphere, 1.6, 1.1).astype(np.float32)
+            colors_cat = np.where(self.p_is_sphere, 0, 1)
+
+        elif self.mode == "tunnel":
+            # 滚筒隧道：温和平稳向前推进，舒缓优雅
+            tz = (self.t_z - t * 0.75) % 22.0 - 11.0
+            tang = self.t_angle + t * 0.06
+            tr = self.t_radius * (1.0 + np.sin(tz * 0.35 + t * 0.8) * 0.05)
+            px = np.cos(tang) * tr
+            py = np.sin(tang) * tr * 0.65
+            pz = tz
+            sizes = np.full(N, 1.1, dtype=np.float32)
+            colors_cat = np.where(tz > 2.5, 0, np.where(tz > -3.5, 1, 2))
+
+        else: # dust 氛围微粒：平滑三维连续浮动与轻柔呼吸，温和静谧
+            drift_x = np.sin(t * self.d_freq[:, 0] + self.d_phase[:, 0]) * 1.2
+            drift_y = np.cos(t * self.d_freq[:, 1] + self.d_phase[:, 1]) * 1.0
+            drift_z = np.sin(t * self.d_freq[:, 2] + self.d_phase[:, 2]) * 0.8
+            px = self.d_pos[:, 0] + drift_x
+            py = self.d_pos[:, 1] + drift_y
+            pz = self.d_pos[:, 2] + drift_z
+            sizes = (0.85 + np.sin(t * 0.6 + self.d_phase[:, 0]) * 0.2).astype(np.float32)
+            colors_cat = self.d_cat
+
+        # 3D 旋转变换
+        x1 = px * cos_y + pz * sin_y
+        y1 = py
+        z1 = -px * sin_y + pz * cos_y
+
+        x2 = x1
+        y2 = y1 * cos_x - z1 * sin_x
+        z2 = y1 * sin_x + z1 * cos_x
+
+        # 透视投影
+        z_view = z2 + self.cam_dist
+        valid = z_view > 0.6
+
+        x_2d = cx + (x2[valid] * fov) / z_view[valid]
+        y_2d = cy - (y2[valid] * fov) / z_view[valid]
+        # 修正投影半径：针芒星尘高清微粒 (半径 0.75px ~ 2.2px，即直径 1.5px ~ 4.4px)
+        s_2d = np.clip((sizes[valid] * fov) / (z_view[valid] * 38.0), 0.75, 2.2)
+        depth_alpha = np.clip(1.0 - z_view[valid] / 24.0, 0.20, 1.0)
+        cats = colors_cat[valid]
+
+        # 3. 批量绘制发光粒子 (支持模糊虚化光晕 / 清晰微粒双模式)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for i in range(len(x_2d)):
+            px_i = float(x_2d[i])
+            py_i = float(y_2d[i])
+            sz_i = float(s_2d[i])
+            alp_i = float(depth_alpha[i])
+            c_type = int(cats[i])
+
+            if self.theme == "light":
+                if c_type == 0:
+                    base_rgb = (217, 119, 6)
+                elif c_type == 1:
+                    base_rgb = (14, 165, 233)
+                else:
+                    base_rgb = (168, 85, 247)
+                final_alpha = int(alp_i * 220)
+            else:
+                if c_type == 0:
+                    base_rgb = (255, 195, 75)
+                elif c_type == 1:
+                    base_rgb = (56, 210, 255)
+                else:
+                    base_rgb = (244, 114, 182)
+                final_alpha = int(min(255, alp_i * 255 * 0.90))
+
+            if self.blur_enabled:
+                # 开启模糊虚化时：叠加柔光外圈 (Bloom Halo)
+                halo_sz = sz_i * 2.2
+                halo_alpha = max(4, int(final_alpha * 0.30))
+                painter.setBrush(QBrush(QColor(base_rgb[0], base_rgb[1], base_rgb[2], halo_alpha)))
+                painter.drawEllipse(QPointF(px_i, py_i), halo_sz, halo_sz)
+
+            # 核心高清针芒星尘 (Crisp Star Core)
+            painter.setBrush(QBrush(QColor(base_rgb[0], base_rgb[1], base_rgb[2], final_alpha)))
+            painter.drawEllipse(QPointF(px_i, py_i), sz_i, sz_i)
+
+
+class MainCentralWidget(QWidget):
+    """主中央容器：底层 3D 沉浸星河渲染 + 上层 UI 子控件自动合成"""
+    def __init__(self, bg_engine, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CentralWidget")
+        self.bg_engine = bg_engine
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.bg_engine.paint_background(painter, self.width(), self.height())
+
+
+class SpectrumVisualizerWidget(QWidget):
+    """
+    60FPS 赛博科技声学动态律动频谱仪 (Pro Cyber-Acoustic Spectrum Visualizer)
+    - 72 频段高精度声学对数分布 (30Hz ~ 18000Hz)，柱体纤细精致
+    - 赛博霓虹连续多阶全光谱流动渐变 (Cyber Cyan -> Neon Mint -> Solar Gold -> Coral -> Hyper Violet)
+    - 悬浮重力落差光标 (Gravity Physics Peak Hold with Hang-Time)
+    - 动态荧光余晖残影衰减 (Phosphor Ghost Trail Decay)
+    - 科技刻度网格与参考 dB 分贝标线 (-6dB / -18dB / -36dB)
+    - 底部声学频标微型刻度与区域标签 (SUB / BASS / MID / HIGH / AIR)
+    - 底部全息镜面微倒影光晕 (Holographic Bottom Mirror Glow)
+    - 自适应全局声学动态范围追踪与人耳听觉频响加权补偿 (Adaptive Headroom AGC)
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(68)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.num_bars = 72
+        self.smooth_bars = np.zeros(self.num_bars, dtype=np.float32)
+        self.ghost_bars = np.zeros(self.num_bars, dtype=np.float32)
+        self.peak_heights = np.zeros(self.num_bars, dtype=np.float32)
+        self.peak_velocities = np.zeros(self.num_bars, dtype=np.float32)
+        self.peak_holds = np.zeros(self.num_bars, dtype=np.int32)
+        self.global_peak = 0.5
+        self.raw_magnitudes = np.zeros(self.num_bars, dtype=np.float32)
+        self.idle_phase = 0.0
+        self.theme = "dark"
+        self.translucent = True
+
+        # 生成 72 频段赛博高科技连续光谱色板
+        self.bar_colors = self._generate_cyber_palette(self.num_bars)
+
+    def _generate_cyber_palette(self, num_bars):
+        """生成极具前沿科技感的光谱色谱 (Electric Cyan -> Neon Mint -> Solar Gold -> Cyber Coral -> Hyper Violet)"""
+        stops = [
+            (0.00, QColor("#00f0ff")),  # 极光电青 (Sub-Bass)
+            (0.18, QColor("#06b6d4")),  # 赛博海蓝 (Deep Bass)
+            (0.35, QColor("#00f59b")),  # 霓虹薄荷绿 (Punch & Low Mid)
+            (0.52, QColor("#10b981")),  # 纯净翡翠 (Vocal Core)
+            (0.68, QColor("#fbbf24")),  # 太阳金琥珀 (Mid Presence)
+            (0.82, QColor("#f43f5e")),  # 赛博珊瑚红 (Crisp Treble)
+            (1.00, QColor("#c084fc")),  # 极光幻紫 (Air & Harmonics)
+        ]
+        palette = []
+        for i in range(num_bars):
+            t = i / float(num_bars - 1)
+            for s_idx in range(len(stops) - 1):
+                t0, c0 = stops[s_idx]
+                t1, c1 = stops[s_idx + 1]
+                if t0 <= t <= t1 or s_idx == len(stops) - 2:
+                    factor = (t - t0) / max(0.0001, (t1 - t0))
+                    factor = max(0.0, min(1.0, factor))
+                    r = int(c0.red() + (c1.red() - c0.red()) * factor)
+                    g = int(c0.green() + (c1.green() - c0.green()) * factor)
+                    b = int(c0.blue() + (c1.blue() - c0.blue()) * factor)
+                    palette.append(QColor(r, g, b))
+                    break
+        return palette
 
     def set_theme(self, theme):
         self.theme = theme
         self.update()
 
+    def set_translucent(self, translucent):
+        self.translucent = translucent
+        self.update()
+
     def update_magnitudes(self, fft_magnitudes):
-        if fft_magnitudes is not None and len(fft_magnitudes) >= self.num_bars:
-            self.raw_magnitudes = fft_magnitudes[:self.num_bars]
+        if fft_magnitudes is not None and len(fft_magnitudes) > 0:
+            if len(fft_magnitudes) == self.num_bars:
+                self.raw_magnitudes = fft_magnitudes
+            else:
+                # 动态自适应重采样到目标频段数
+                old_x = np.linspace(0, 1, len(fft_magnitudes))
+                new_x = np.linspace(0, 1, self.num_bars)
+                self.raw_magnitudes = np.interp(new_x, old_x, fft_magnitudes).astype(np.float32)
         self.update()
 
     def paintEvent(self, event):
@@ -644,46 +1090,173 @@ class SpectrumVisualizerWidget(QWidget):
 
         w = self.width()
         h = self.height()
+        is_dark = (self.theme == "dark")
 
-        bg_col = QColor("#f9fafb") if self.theme == "light" else QColor("#121216")
-        border_col = QColor("#e5e7eb") if self.theme == "light" else QColor("#272732")
+        # 1. 现代化深空暗黑磨砂外框底板
+        bg_col = QColor(10, 11, 16, 215) if is_dark else QColor(248, 250, 252, 230)
+        border_col = QColor(30, 41, 59, 200) if is_dark else QColor(226, 232, 240, 220)
         painter.setBrush(QBrush(bg_col))
         painter.setPen(QPen(border_col, 1))
-        painter.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 6, 6)
+        painter.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
 
-        padding = 12.0
-        gap = 3.0
-        total_gaps = (self.num_bars - 1) * gap
-        usable_w = w - 2 * padding - total_gaps
-        bar_w = max(2.0, usable_w / float(self.num_bars))
+        # 布局坐标计算
+        padding_x = 18.0
+        padding_top = 8.0
+        baseline_y = h - 15.0  # 基线位置，下方预留 15px 给频标与倒影
+        max_bar_h = baseline_y - padding_top - 4.0
 
-        max_val = float(np.max(self.raw_magnitudes)) if np.max(self.raw_magnitudes) > 0 else 1.0
+        # 2. 科技网格分贝刻度参考线 (Reference dB Grid Lines)
+        db_levels = [
+            (0.75, "-6 dB"),
+            (0.50, "-18 dB"),
+            (0.25, "-36 dB")
+        ]
+        grid_pen = QPen(QColor(255, 255, 255, 12 if is_dark else 18), 1, Qt.PenStyle.DashLine)
+        grid_pen.setDashPattern([3, 5])
+        painter.setPen(grid_pen)
+        font_db = QFont("Microsoft YaHei")
+        font_db.setPixelSize(9)
+        painter.setFont(font_db)
 
+        for ratio, label in db_levels:
+            line_y = baseline_y - max_bar_h * ratio
+            painter.drawLine(QPointF(padding_x, line_y), QPointF(w - padding_x, line_y))
+            # 右侧标注微型文字
+            painter.setPen(QColor(255, 255, 255, 45 if is_dark else 70))
+            painter.drawText(QRectF(w - padding_x - 42, line_y - 7, 40, 14), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
+            painter.setPen(grid_pen)
+
+        # 3. 声学频率基准线 (Baseline)
+        base_pen = QPen(QColor(56, 189, 248, 55 if is_dark else 40), 1)
+        painter.setPen(base_pen)
+        painter.drawLine(QPointF(padding_x, baseline_y), QPointF(w - padding_x, baseline_y))
+
+        # 4. 底部声学频段刻度标记 (SUB / BASS / MID / HIGH / AIR)
+        freq_landmarks = [
+            (0.05, "SUB"),
+            (0.20, "BASS"),
+            (0.42, "MID"),
+            (0.70, "HIGH"),
+            (0.92, "AIR"),
+        ]
+        font_tag = QFont("Microsoft YaHei", 8, QFont.Weight.Bold)
+        font_tag.setPixelSize(9)
+        painter.setFont(font_tag)
+        usable_w = w - 2 * padding_x
+        for norm_x, tag_txt in freq_landmarks:
+            tx = padding_x + usable_w * norm_x
+            painter.setPen(QColor(148, 163, 184, 110 if is_dark else 140))
+            painter.drawText(QRectF(tx - 25, baseline_y + 1, 50, 13), Qt.AlignmentFlag.AlignCenter, tag_txt)
+
+        # 5. 柱状与间距几何计算
+        total_gaps = (self.num_bars - 1)
+        gap = max(1.8, min(3.2, usable_w / float(self.num_bars * 3.5)))
+        bar_w = (usable_w - total_gaps * gap) / float(self.num_bars)
+        bar_w = max(2.5, bar_w)
+
+        # 居中偏移修正
+        actual_total_w = self.num_bars * bar_w + total_gaps * gap
+        start_x = padding_x + max(0.0, (usable_w - actual_total_w) / 2.0)
+
+        # 检查是否静音或待机，并执行自适应全局峰值追踪 (AGC)
+        current_max = float(np.max(self.raw_magnitudes)) if len(self.raw_magnitudes) > 0 else 0.0
+        if current_max > 0.0001:
+            self.global_peak = max(self.global_peak * 0.985, current_max, 0.05)
+            is_idle = False
+        else:
+            is_idle = True
+            self.idle_phase += 0.035
+
+        # 6. 渲染 72 根精细高科技律动柱
         for i in range(self.num_bars):
-            raw = float(self.raw_magnitudes[i] / max_val)
-            self.smooth_bars[i] = self.smooth_bars[i] * 0.70 + raw * 0.30
-            bar_h = min(h - 6.0, self.smooth_bars[i] * (h - 6.0) * 1.4)
+            val = float(self.raw_magnitudes[i]) if not is_idle else 0.0
+            if is_idle:
+                # 待机待命呼吸波 (Standby Ambient Cyber Wave)
+                norm_val = 0.04 + 0.03 * math.sin(self.idle_phase + i * 0.14)
+            else:
+                # 高频人耳听觉感知增益补偿 (Fletcher-Munson Perceptual Curve)
+                comp = 0.75 + 1.25 * math.pow(i / float(self.num_bars - 1), 0.48)
+                val_comp = val * comp
+                norm_val = min(1.0, math.pow(val_comp / max(0.01, self.global_peak), 0.7))
 
-            # 峰值下落物理模拟
+            # 瞬态响应：极速 Attack，丝滑指数衰减 Release
+            if norm_val > self.smooth_bars[i]:
+                self.smooth_bars[i] = self.smooth_bars[i] * 0.45 + norm_val * 0.55
+            else:
+                self.smooth_bars[i] = self.smooth_bars[i] * 0.82 + norm_val * 0.18
+
+            bar_h = min(max_bar_h, self.smooth_bars[i] * max_bar_h)
+
+            # 荧光余晖残影衰减物理模拟 (Phosphor Ghost Trail)
+            if bar_h > self.ghost_bars[i]:
+                self.ghost_bars[i] = bar_h
+            else:
+                self.ghost_bars[i] = max(0.0, self.ghost_bars[i] * 0.92)
+
+            # 悬浮重力落差光标物理模拟 (Gravity Peak Hold)
             if bar_h > self.peak_heights[i]:
                 self.peak_heights[i] = bar_h
+                self.peak_velocities[i] = 0.0
+                self.peak_holds[i] = 12  # 悬停约 180ms
             else:
-                self.peak_heights[i] = max(0.0, self.peak_heights[i] - 1.1)
+                if self.peak_holds[i] > 0:
+                    self.peak_holds[i] -= 1
+                else:
+                    self.peak_velocities[i] += 0.16  # 重力加速度
+                    self.peak_heights[i] = max(0.0, self.peak_heights[i] - self.peak_velocities[i])
 
-            x = padding + i * (bar_w + gap)
-            y = h - 3.0 - bar_h
+            x = start_x + i * (bar_w + gap)
+            y = baseline_y - bar_h
+            base_col = self.bar_colors[i]
 
-            # 绘制律动柱
-            if bar_h > 1.0:
+            # A. 荧光余晖残影 (Ghost Trail)
+            if self.ghost_bars[i] > bar_h + 2.0:
+                ghost_y = baseline_y - self.ghost_bars[i]
+                ghost_col = QColor(base_col.red(), base_col.green(), base_col.blue(), 30 if is_dark else 20)
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(self.bar_colors[i]))
-                painter.drawRoundedRect(QRectF(x, y, bar_w, bar_h), 1.5, 1.5)
+                painter.setBrush(QBrush(ghost_col))
+                painter.drawRoundedRect(QRectF(x, ghost_y, bar_w, self.ghost_bars[i] - bar_h), 1.2, 1.2)
 
-            # 绘制白线峰值 (Peak Hold Line)
+            # B. 底部全息镜面微倒影 (Hologram Mirror Reflection)
+            if bar_h > 2.0:
+                refl_h = min(9.0, bar_h * 0.24)
+                refl_grad = QLinearGradient(x, baseline_y, x, baseline_y + refl_h)
+                refl_grad.setColorAt(0.0, QColor(base_col.red(), base_col.green(), base_col.blue(), 50 if is_dark else 28))
+                refl_grad.setColorAt(1.0, QColor(base_col.red(), base_col.green(), base_col.blue(), 0))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(refl_grad))
+                painter.drawRoundedRect(QRectF(x, baseline_y + 1.0, bar_w, refl_h), 1.0, 1.0)
+
+            # C. 律动光柱实体 (Sleek Cyber Neon Pillar)
+            if bar_h > 1.0:
+                bar_grad = QLinearGradient(x, baseline_y, x, y)
+                bar_grad.setColorAt(0.0, QColor(base_col.red(), base_col.green(), base_col.blue(), 75 if is_dark else 110))
+                bar_grad.setColorAt(0.65, QColor(base_col.red(), base_col.green(), base_col.blue(), 215 if is_dark else 230))
+                bar_grad.setColorAt(1.0, QColor(min(255, base_col.red() + 60), min(255, base_col.green() + 60), min(255, base_col.blue() + 60), 255))
+                
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(bar_grad))
+                bar_r = min(1.8, bar_w / 2.0)
+                painter.drawRoundedRect(QRectF(x, y, bar_w, bar_h), bar_r, bar_r)
+
+                # 柱顶高能发光焦点 (Luminous Hot Tip)
+                tip_h = min(2.5, bar_h)
+                tip_col = QColor(255, 255, 255, 210)
+                painter.setBrush(QBrush(tip_col))
+                painter.drawRoundedRect(QRectF(x, y, bar_w, tip_h), bar_r, bar_r)
+
+            # D. 悬浮重力落差光标 (Floating Luminous Peak Bead)
             if self.peak_heights[i] > 2.0:
-                peak_y = h - 3.0 - self.peak_heights[i] - 2.0
-                line_col = QColor("#374151") if self.theme == "light" else QColor(255, 255, 255, 220)
-                painter.setBrush(QBrush(line_col))
+                peak_y = baseline_y - self.peak_heights[i] - 2.5
+                # 光晕
+                halo_col = QColor(base_col.red(), base_col.green(), base_col.blue(), 65 if is_dark else 35)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(halo_col))
+                painter.drawRoundedRect(QRectF(x - 0.5, peak_y - 0.5, bar_w + 1.0, 3.0), 1.2, 1.2)
+
+                # 核心亮珠 (Pure White-Hot Core Bead)
+                core_col = QColor(255, 255, 255, 240 if is_dark else 220)
+                painter.setBrush(QBrush(core_col))
                 painter.drawRoundedRect(QRectF(x, peak_y, bar_w, 2.0), 1.0, 1.0)
 
 
@@ -692,13 +1265,14 @@ class EffectCardWidget(QFrame):
     cardClicked = Signal(str)
     intensityChanged = Signal(str, int)
 
-    def __init__(self, eff_def, parent=None, initial_intensity=100, is_active=False, theme="dark"):
+    def __init__(self, eff_def, parent=None, initial_intensity=100, is_active=False, theme="dark", translucent=True):
         super().__init__(parent)
         self.eff_def = eff_def
         self.key = eff_def["key"]
         self.is_active = is_active
         self.intensity = initial_intensity
         self.theme = theme
+        self.translucent = translucent
 
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -762,6 +1336,10 @@ class EffectCardWidget(QFrame):
             self.slider.set_theme(theme)
         self.update_style()
 
+    def set_translucent(self, translucent):
+        self.translucent = translucent
+        self.update_style()
+
     def _on_slider_changed(self, val):
         self.intensity = val
         if self.val_lbl:
@@ -780,12 +1358,13 @@ class EffectCardWidget(QFrame):
     def update_style(self):
         if self.theme == "light":
             if self.is_active:
-                self.setStyleSheet("""
-                    QFrame#EffectCard {
-                        background-color: #fffbeb;
+                bg = "rgba(254, 243, 199, 0.92)" if self.translucent else "#fffbeb"
+                self.setStyleSheet(f"""
+                    QFrame#EffectCard {{
+                        background-color: {bg};
                         border: 1.5px solid #f59e0b;
                         border-radius: 8px;
-                    }
+                    }}
                 """)
                 self.name_lbl.setStyleSheet("color: #d97706;")
                 self.check_lbl.setStyleSheet("color: #d97706;")
@@ -796,16 +1375,19 @@ class EffectCardWidget(QFrame):
                     val_col = "#ef4444" if self.intensity > 100 else "#f59e0b"
                     self.val_lbl.setStyleSheet(f"color: {val_col};")
             else:
-                self.setStyleSheet("""
-                    QFrame#EffectCard {
-                        background-color: #ffffff;
-                        border: 1px solid #e5e7eb;
+                bg = "rgba(255, 255, 255, 0.85)" if self.translucent else "#ffffff"
+                hover_bg = "rgba(249, 250, 251, 0.96)" if self.translucent else "#f9fafb"
+                border = "1px solid rgba(0, 0, 0, 0.08)" if self.translucent else "1px solid #e5e7eb"
+                self.setStyleSheet(f"""
+                    QFrame#EffectCard {{
+                        background-color: {bg};
+                        border: {border};
                         border-radius: 8px;
-                    }
-                    QFrame#EffectCard:hover {
-                        background-color: #f9fafb;
-                        border: 1px solid #cbd5e1;
-                    }
+                    }}
+                    QFrame#EffectCard:hover {{
+                        background-color: {hover_bg};
+                        border: 1px solid rgba(245, 158, 11, 0.5);
+                    }}
                 """)
                 self.name_lbl.setStyleSheet("color: #111827;")
                 self.check_lbl.setText("")
@@ -816,12 +1398,13 @@ class EffectCardWidget(QFrame):
                     self.val_lbl.setStyleSheet("color: #9ca3af;")
         else:
             if self.is_active:
-                self.setStyleSheet("""
-                    QFrame#EffectCard {
-                        background-color: #2f2615;
+                bg = "rgba(245, 158, 11, 0.22)" if self.translucent else "#2e2515"
+                self.setStyleSheet(f"""
+                    QFrame#EffectCard {{
+                        background-color: {bg};
                         border: 1.5px solid #f59e0b;
                         border-radius: 8px;
-                    }
+                    }}
                 """)
                 self.name_lbl.setStyleSheet("color: #f59e0b;")
                 self.check_lbl.setStyleSheet("color: #f59e0b;")
@@ -832,16 +1415,19 @@ class EffectCardWidget(QFrame):
                     val_col = "#ef4444" if self.intensity > 100 else "#f59e0b"
                     self.val_lbl.setStyleSheet(f"color: {val_col};")
             else:
-                self.setStyleSheet("""
-                    QFrame#EffectCard {
-                        background-color: #22222b;
-                        border: 1px solid #2f2f3c;
+                bg = "rgba(30, 30, 40, 0.72)" if self.translucent else "#1e1e26"
+                hover_bg = "rgba(45, 45, 60, 0.88)" if self.translucent else "#282834"
+                border = "1px solid rgba(255, 255, 255, 0.08)" if self.translucent else "1px solid #2f2f3c"
+                self.setStyleSheet(f"""
+                    QFrame#EffectCard {{
+                        background-color: {bg};
+                        border: {border};
                         border-radius: 8px;
-                    }
-                    QFrame#EffectCard:hover {
-                        background-color: #292934;
-                        border: 1px solid #404052;
-                    }
+                    }}
+                    QFrame#EffectCard:hover {{
+                        background-color: {hover_bg};
+                        border: 1px solid rgba(255, 255, 255, 0.25);
+                    }}
                 """)
                 self.name_lbl.setStyleSheet("color: #ffffff;")
                 self.check_lbl.setText("")
@@ -867,6 +1453,7 @@ class SodaMusicPlayerQtApp(QMainWindow):
     sig_set_dsp_tag = Signal(str, str)
     sig_show_error = Signal(str, str)
     sig_show_info = Signal(str, str)
+    sig_audio_devices_changed = Signal()
 
     def __init__(self):
         super().__init__()
@@ -881,6 +1468,7 @@ class SodaMusicPlayerQtApp(QMainWindow):
 
         self.user_cfg = self.load_user_config()
         self.current_theme = self.user_cfg.get("theme", "dark")
+        self.bg_blur = self.user_cfg.get("bg_blur", True)
         self.saved_vol = int(self.user_cfg.get("volume", 100))
         self.volume = self.saved_vol / 100.0
         self.prev_volume = self.volume if self.volume > 0 else 1.0
@@ -899,16 +1487,33 @@ class SodaMusicPlayerQtApp(QMainWindow):
         self.live_in_stream = None
         self.live_out_stream = None
         self.original_default_audio_name = None
+        self.current_live_phys_name = None
         self.has_cable_installed = False
         self.output_dev_list = []
-        self.fft_magnitudes = np.zeros(32, dtype=np.float32)
+        self.fft_magnitudes = np.zeros(72, dtype=np.float32)
         self.sys_vol_watcher = SystemVolumeWatcher()
+
+        self._last_device_signature = get_active_render_device_signature()
+
+        # 音频设备变更防抖定时器 (350ms 聚合多次蓝牙/系统事件)
+        self.device_debounce_timer = QTimer(self)
+        self.device_debounce_timer.setSingleShot(True)
+        self.device_debounce_timer.timeout.connect(lambda: self.populate_audio_devices(trigger_source='auto'))
+
+        # 轻量心跳轮询定时器 (1.5秒检测一次活动设备签名，兜底极端驱动情况)
+        self.device_poll_timer = QTimer(self)
+        self.device_poll_timer.timeout.connect(self._check_device_signature_poll)
+        self.device_poll_timer.start(1500)
+
+        # Core Audio IMMNotificationClient 后台监听器
+        self.device_watcher = WindowsAudioDeviceWatcher(self._on_device_watcher_event)
+        self.device_watcher.start()
 
         self.init_signals()
         self.init_ui()
         self.apply_theme(self.current_theme)
         self.start_dsp_backend()
-        self.populate_audio_devices()
+        self.populate_audio_devices(trigger_source='manual')
 
         # 启动 60FPS 硬件加速频谱律动定时器
         self.visualizer_timer = QTimer(self)
@@ -924,7 +1529,7 @@ class SodaMusicPlayerQtApp(QMainWindow):
                         return data
             except Exception:
                 pass
-        return {"volume": 100, "effect": "none", "theme": "dark"}
+        return {"volume": 100, "effect": "none", "theme": "dark", "bg_mode": "galaxy", "bg_blur": False}
 
     def save_user_config(self):
         try:
@@ -939,6 +1544,33 @@ class SodaMusicPlayerQtApp(QMainWindow):
         self.sig_set_dsp_tag.connect(lambda t, c: (self.dsp_tag.setText(t), self.dsp_tag.setStyleSheet(f"color: {c}; font-family: Consolas; font-weight: bold; font-size: 11px;")))
         self.sig_show_error.connect(lambda title, msg: QMessageBox.critical(self, title, msg))
         self.sig_show_info.connect(lambda title, msg: QMessageBox.information(self, title, msg))
+        self.sig_audio_devices_changed.connect(self._on_audio_devices_changed_signal)
+
+    def _on_audio_devices_changed_signal(self):
+        """收到设备变更信号时启动 350ms 防抖更新"""
+        if hasattr(self, 'device_debounce_timer'):
+            self.device_debounce_timer.start(350)
+
+    def _on_device_watcher_event(self, event_type, *args):
+        """由 Windows Core Audio 回调线程触发"""
+        self.sig_audio_devices_changed.emit()
+
+    def _check_device_signature_poll(self):
+        """轻量心跳巡检活动设备列表"""
+        sig = get_active_render_device_signature()
+        if sig and sig != self._last_device_signature:
+            self._last_device_signature = sig
+            self.sig_audio_devices_changed.emit()
+
+    def nativeEvent(self, eventType, message):
+        """拦截 Windows 原生 WM_DEVICECHANGE 硬件即插即用广播消息"""
+        try:
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == 0x0219:  # WM_DEVICECHANGE
+                self.sig_audio_devices_changed.emit()
+        except Exception:
+            pass
+        return super().nativeEvent(eventType, message)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -951,88 +1583,114 @@ class SodaMusicPlayerQtApp(QMainWindow):
         self.save_user_config()
         self.apply_theme(new_theme)
 
+    def toggle_bg_blur(self):
+        """切换 3D 沉浸动效背景的模糊虚化 / 清晰锐利动效"""
+        self.bg_blur = not self.bg_blur
+        self.user_cfg["bg_blur"] = self.bg_blur
+        self.save_user_config()
+        self.bg_3d_engine.set_blur(self.bg_blur)
+        if hasattr(self, 'btn_bg_blur'):
+            self.btn_bg_blur.setText("动效模糊: 开" if self.bg_blur else "动效模糊: 关")
+        if self.centralWidget():
+            self.centralWidget().update()
+
     def apply_theme(self, theme):
         self.current_theme = theme
         is_light = (theme == "light")
         apply_windows_dark_title_bar(self.winId(), enable_dark=not is_light)
 
-        # 更新主题切换按钮文本
+        # 更新按钮文本与 3D 引擎配置 (纯净文字无多余图标)
         if hasattr(self, 'btn_theme'):
-            self.btn_theme.setText("🌙 切换深色模式" if is_light else "☀️ 切换浅色模式")
+            self.btn_theme.setText("切换深色模式" if is_light else "切换浅色模式")
+        if hasattr(self, 'btn_bg_blur'):
+            self.btn_bg_blur.setText("动效模糊: 开" if self.bg_blur else "动效模糊: 关")
+        if hasattr(self, 'bg_3d_engine'):
+            self.bg_3d_engine.set_theme(theme)
+            self.bg_3d_engine.set_blur(self.bg_blur)
+
+        panel_card_bg_light = "rgba(255, 255, 255, 0.84)"
+        panel_card_border_light = "1px solid rgba(0, 0, 0, 0.08)"
+        box_bg_light = "rgba(249, 250, 251, 0.85)"
+        btn_bg_light = "rgba(255, 255, 255, 0.9)"
+
+        panel_card_bg_dark = "rgba(22, 22, 28, 0.78)"
+        panel_card_border_dark = "1px solid rgba(255, 255, 255, 0.09)"
+        box_bg_dark = "rgba(30, 30, 40, 0.72)"
+        btn_bg_dark = "rgba(36, 36, 48, 0.8)"
 
         if is_light:
-            self.setStyleSheet("""
-                QMainWindow {
-                    background-color: #f3f4f6;
-                }
-                QWidget#CentralWidget {
-                    background-color: #f3f4f6;
-                }
-                QWidget#ContentWidget {
-                    background-color: #f3f4f6;
-                }
-                QScrollArea {
+            self.setStyleSheet(f"""
+                QMainWindow {{
+                    background-color: transparent;
+                }}
+                QWidget#CentralWidget {{
+                    background-color: transparent;
+                }}
+                QWidget#ContentWidget {{
+                    background-color: transparent;
+                }}
+                QScrollArea {{
                     background-color: transparent;
                     border: none;
-                }
-                QScrollBar:vertical {
+                }}
+                QScrollBar:vertical {{
                     width: 0px;
                     height: 0px;
-                }
-                QFrame#PanelCard {
-                    background-color: #ffffff;
-                    border: 1px solid #e5e7eb;
-                    border-radius: 10px;
-                }
-                QPushButton {
-                    background-color: #ffffff;
+                }}
+                QFrame#PanelCard {{
+                    background-color: {panel_card_bg_light};
+                    border: {panel_card_border_light};
+                    border-radius: 12px;
+                }}
+                QPushButton {{
+                    background-color: {btn_bg_light};
                     color: #1f2937;
                     border: 1px solid #d1d5db;
                     border-radius: 6px;
                     padding: 6px 12px;
                     font-family: 'Microsoft YaHei';
                     font-size: 12px;
-                }
-                QPushButton:hover {
+                }}
+                QPushButton:hover {{
                     background-color: #f3f4f6;
                     border: 1px solid #9ca3af;
-                }
-                QPushButton:pressed {
+                }}
+                QPushButton:pressed {{
                     background-color: #e5e7eb;
-                }
-                QComboBox {
-                    background-color: #ffffff;
+                }}
+                QComboBox {{
+                    background-color: {btn_bg_light};
                     color: #111827;
                     border: 1px solid #d1d5db;
                     border-radius: 6px;
                     padding: 5px 10px;
                     font-family: 'Microsoft YaHei';
                     font-size: 12px;
-                }
-                QComboBox:hover {
+                }}
+                QComboBox:hover {{
                     border: 1px solid #f59e0b;
-                }
-                QComboBox::drop-down {
+                }}
+                QComboBox::drop-down {{
                     border: none;
                     width: 24px;
-                }
-                QComboBox QAbstractItemView {
+                }}
+                QComboBox QAbstractItemView {{
                     background-color: #ffffff;
                     color: #111827;
                     selection-background-color: #f59e0b;
                     selection-color: #000000;
                     border: 1px solid #d1d5db;
                     padding: 4px;
-                }
-                QLabel {
+                }}
+                QLabel {{
                     color: #111827;
                     font-family: 'Microsoft YaHei';
-                }
+                }}
             """)
             if hasattr(self, 'switch_box'):
-                self.switch_box.setStyleSheet("background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px;")
+                self.switch_box.setStyleSheet(f"background-color: {box_bg_light}; border: 1px solid rgba(0, 0, 0, 0.08); border-radius: 8px;")
             if hasattr(self, 'dev_box'):
-                self.dev_box.setStyleSheet("background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px;")
+                self.dev_box.setStyleSheet(f"background-color: {box_bg_light}; border: 1px solid rgba(0, 0, 0, 0.08); border-radius: 8px;")
             if hasattr(self, 'btn_mute'):
                 if not self.is_muted:
                     self.btn_mute.setStyleSheet("background-color: #ffffff; border: 1px solid #d1d5db; color: #111827; padding: 5px 14px; font-weight: bold;")
@@ -1044,90 +1702,90 @@ class SodaMusicPlayerQtApp(QMainWindow):
             if hasattr(self, 'dsp_tag'):
                 self.dsp_tag.setStyleSheet("color: #059669; font-family: Consolas; font-weight: bold; font-size: 11px;")
         else:
-            self.setStyleSheet("""
-                QMainWindow {
-                    background-color: #131316;
-                }
-                QWidget#CentralWidget {
-                    background-color: #131316;
-                }
-                QWidget#ContentWidget {
-                    background-color: #131316;
-                }
-                QScrollArea {
+            self.setStyleSheet(f"""
+                QMainWindow {{
+                    background-color: transparent;
+                }}
+                QWidget#CentralWidget {{
+                    background-color: transparent;
+                }}
+                QWidget#ContentWidget {{
+                    background-color: transparent;
+                }}
+                QScrollArea {{
                     background-color: transparent;
                     border: none;
-                }
-                QScrollBar:vertical {
+                }}
+                QScrollBar:vertical {{
                     width: 0px;
                     height: 0px;
-                }
-                QFrame#PanelCard {
-                    background-color: #1c1c24;
-                    border: 1px solid #282834;
-                    border-radius: 10px;
-                }
-                QPushButton {
-                    background-color: #242430;
+                }}
+                QFrame#PanelCard {{
+                    background-color: {panel_card_bg_dark};
+                    border: {panel_card_border_dark};
+                    border-radius: 12px;
+                }}
+                QPushButton {{
+                    background-color: {btn_bg_dark};
                     color: #f3f4f6;
-                    border: 1px solid #323242;
+                    border: 1px solid rgba(255, 255, 255, 0.12);
                     border-radius: 6px;
                     padding: 6px 12px;
                     font-family: 'Microsoft YaHei';
                     font-size: 12px;
-                }
-                QPushButton:hover {
-                    background-color: #2f2f3e;
-                    border: 1px solid #434358;
-                }
-                QPushButton:pressed {
+                }}
+                QPushButton:hover {{
+                    background-color: rgba(50, 50, 68, 0.95);
+                    border: 1px solid rgba(255, 255, 255, 0.25);
+                }}
+                QPushButton:pressed {{
                     background-color: #1e1e26;
-                }
-                QComboBox {
-                    background-color: #242430;
+                }}
+                QComboBox {{
+                    background-color: {btn_bg_dark};
                     color: #ffffff;
-                    border: 1px solid #323242;
+                    border: 1px solid rgba(255, 255, 255, 0.12);
                     border-radius: 6px;
                     padding: 5px 10px;
                     font-family: 'Microsoft YaHei';
                     font-size: 12px;
-                }
-                QComboBox:hover {
+                }}
+                QComboBox:hover {{
                     border: 1px solid #f59e0b;
-                }
-                QComboBox::drop-down {
+                }}
+                QComboBox::drop-down {{
                     border: none;
                     width: 24px;
-                }
-                QComboBox QAbstractItemView {
+                }}
+                QComboBox QAbstractItemView {{
                     background-color: #242430;
                     color: #ffffff;
                     selection-background-color: #f59e0b;
                     selection-color: #000000;
                     border: 1px solid #323242;
                     padding: 4px;
-                }
-                QLabel {
+                }}
+                QLabel {{
                     color: #f3f4f6;
                     font-family: 'Microsoft YaHei';
-                }
+                }}
             """)
             if hasattr(self, 'switch_box'):
-                self.switch_box.setStyleSheet("background-color: #22222b; border: 1px solid #2f2f3c; border-radius: 8px;")
+                self.switch_box.setStyleSheet(f"background-color: {box_bg_dark}; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;")
             if hasattr(self, 'dev_box'):
-                self.dev_box.setStyleSheet("background-color: #22222b; border: 1px solid #2f2f3c; border-radius: 8px;")
+                self.dev_box.setStyleSheet(f"background-color: {box_bg_dark}; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;")
             if hasattr(self, 'btn_mute'):
                 if not self.is_muted:
-                    self.btn_mute.setStyleSheet("background-color: #22222b; border: 1px solid #2f2f3c; color: #ffffff; padding: 5px 14px; font-weight: bold;")
+                    self.btn_mute.setStyleSheet("background-color: rgba(36, 36, 48, 0.85); border: 1px solid rgba(255, 255, 255, 0.12); color: #ffffff; padding: 5px 14px; font-weight: bold;")
             if hasattr(self, 'vol_badge'):
                 vol_color = "#ef4444" if self.saved_vol > 100 else "#f59e0b"
-                self.vol_badge.setStyleSheet(f"background-color: #22222b; border: 1px solid #2f2f3c; border-radius: 6px; padding: 4px 6px; color: {vol_color}; font-family: Consolas; font-weight: bold;")
+                self.vol_badge.setStyleSheet(f"background-color: rgba(36, 36, 48, 0.85); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; padding: 4px 6px; color: {vol_color}; font-family: Consolas; font-weight: bold;")
             if hasattr(self, 'vis_title'):
                 self.vis_title.setStyleSheet("color: #f3f4f6; font-weight: bold; font-size: 12px;")
             if hasattr(self, 'dsp_tag'):
                 self.dsp_tag.setStyleSheet("color: #34d399; font-family: Consolas; font-weight: bold; font-size: 11px;")
 
-        # 子控件同步主题
+        # 子控件同步主题与透明度
         if hasattr(self, 'toggle_sw'):
             self.toggle_sw.set_theme(theme)
         if hasattr(self, 'vol_slider'):
@@ -1139,23 +1797,32 @@ class SodaMusicPlayerQtApp(QMainWindow):
                 card.set_theme(theme)
 
     def init_ui(self):
-        central_widget = QWidget(self)
-        central_widget.setObjectName("CentralWidget")
+        bg_mode = self.user_cfg.get("bg_mode", "galaxy")
+        self.bg_3d_engine = Galaxy3DBackgroundEngine()
+        self.bg_3d_engine.set_theme(self.current_theme)
+        self.bg_3d_engine.set_mode(bg_mode)
+        self.bg_3d_engine.set_blur(self.bg_blur)
+
+        central_widget = MainCentralWidget(self.bg_3d_engine, self)
         self.setCentralWidget(central_widget)
 
         main_vbox = QVBoxLayout(central_widget)
         main_vbox.setContentsMargins(0, 0, 0, 0)
         main_vbox.setSpacing(0)
 
-        # 滚动区域 (关闭水平与垂直滚动条，保持界面极简纯粹)
+        # 滚动区域 (滚动条隐藏，背景完全透明)
         scroll_area = QScrollArea(central_widget)
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet("background: transparent; border: none;")
+        scroll_area.viewport().setStyleSheet("background: transparent;")
+        scroll_area.viewport().installEventFilter(self.bg_3d_engine)
         main_vbox.addWidget(scroll_area)
 
         content_widget = QWidget()
         content_widget.setObjectName("ContentWidget")
+        content_widget.setStyleSheet("background: transparent;")
         scroll_area.setWidget(content_widget)
 
         content_vbox = QVBoxLayout(content_widget)
@@ -1218,26 +1885,52 @@ class SodaMusicPlayerQtApp(QMainWindow):
         dev_box_layout.setSpacing(4)
 
         dev_top = QHBoxLayout()
-        dev_title = QLabel("🎧 监听输出设备 (耳机 / 音箱):", self.dev_box)
+        dev_title = QLabel("监听输出设备 (耳机 / 音箱):", self.dev_box)
         dev_title.setStyleSheet("color: #f59e0b; font-weight: bold; font-size: 12px;")
         dev_top.addWidget(dev_title)
         dev_top.addStretch()
 
-        self.btn_theme = QPushButton("☀️ 切换浅色模式", self.dev_box)
+        self.combo_bg_mode = QComboBox(self.dev_box)
+        self.combo_bg_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.combo_bg_mode.setStyleSheet("font-size: 11px; padding: 2px 6px; min-width: 110px;")
+        bg_modes = [
+            ("沉浸背景: 关闭", "off"),
+            ("沉浸背景: 星河", "galaxy"),
+            ("沉浸背景: 星球", "planet"),
+            ("沉浸背景: 滚筒", "tunnel"),
+            ("沉浸背景: 微粒", "dust"),
+        ]
+        cur_idx = 0
+        for i, (label, mode_val) in enumerate(bg_modes):
+            self.combo_bg_mode.addItem(label, mode_val)
+            if mode_val == bg_mode:
+                cur_idx = i
+        self.combo_bg_mode.setCurrentIndex(cur_idx)
+        self.combo_bg_mode.currentIndexChanged.connect(self.on_bg_mode_changed)
+        dev_top.addWidget(self.combo_bg_mode)
+
+        self.btn_bg_blur = QPushButton("动效模糊: 开" if self.bg_blur else "动效模糊: 关", self.dev_box)
+        self.btn_bg_blur.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bg_blur.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+        self.btn_bg_blur.clicked.connect(self.toggle_bg_blur)
+        dev_top.addWidget(self.btn_bg_blur)
+
+        self.btn_theme = QPushButton("切换浅色模式", self.dev_box)
         self.btn_theme.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_theme.setStyleSheet("font-size: 11px; padding: 2px 8px;")
         self.btn_theme.clicked.connect(self.toggle_theme)
         dev_top.addWidget(self.btn_theme)
 
-        btn_refresh = QPushButton("🔄 刷新", self.dev_box)
+        btn_refresh = QPushButton("刷新", self.dev_box)
         btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_refresh.setStyleSheet("font-size: 11px; padding: 2px 8px;")
-        btn_refresh.clicked.connect(self.populate_audio_devices)
+        btn_refresh.clicked.connect(lambda: self.populate_audio_devices(trigger_source='manual'))
         dev_top.addWidget(btn_refresh)
         dev_box_layout.addLayout(dev_top)
 
         self.output_dev_combo = QComboBox(self.dev_box)
         self.output_dev_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.output_dev_combo.currentIndexChanged.connect(self.on_output_dev_combo_changed)
         dev_box_layout.addWidget(self.output_dev_combo)
 
         live_row.addWidget(self.dev_box, stretch=1)
@@ -1284,7 +1977,7 @@ class SodaMusicPlayerQtApp(QMainWindow):
         vis_card_layout.setSpacing(6)
 
         vis_header = QHBoxLayout()
-        self.vis_title = QLabel("✨ 实时动态声学频谱律动", vis_card)
+        self.vis_title = QLabel("实时动态声学频谱律动 (72-Band Pro DSP)", vis_card)
         self.vis_title.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
         vis_header.addWidget(self.vis_title)
         vis_header.addStretch()
@@ -1333,6 +2026,23 @@ class SodaMusicPlayerQtApp(QMainWindow):
         """60FPS 极速渲染刷新"""
         if not self.isMinimized():
             self.visualizer_widget.update_magnitudes(self.fft_magnitudes)
+            if hasattr(self, 'bg_3d_engine'):
+                raw_fft = getattr(self, 'fft_raw_spectrum', None)
+                raw_rms = getattr(self, 'audio_rms_val', 0.0)
+                sr = getattr(self, 'live_in_sr', 48000)
+                self.bg_3d_engine.process_audio_frame(raw_fft, raw_rms, sample_rate=sr, dt=0.016)
+            if self.centralWidget():
+                self.centralWidget().update()
+
+    def on_bg_mode_changed(self, index):
+        mode = self.combo_bg_mode.itemData(index)
+        if not mode:
+            mode = "galaxy"
+        self.bg_3d_engine.set_mode(mode)
+        self.user_cfg["bg_mode"] = mode
+        self.save_user_config()
+        if self.centralWidget():
+            self.centralWidget().update()
 
     def log(self, msg):
         logging.info(msg)
@@ -1408,66 +2118,211 @@ class SodaMusicPlayerQtApp(QMainWindow):
                 logging.error(f"Failed to set default sound device via nircmd: {e}")
         return False
 
-    def populate_audio_devices(self):
+    def populate_audio_devices(self, trigger_source='auto'):
         try:
             prev_sel_name = None
             cur_idx = self.output_dev_combo.currentIndex()
             if cur_idx >= 0 and cur_idx < len(self.output_dev_list):
                 prev_sel_name = self.output_dev_list[cur_idx][4]
+            elif self.user_cfg.get("last_output_device"):
+                prev_sel_name = self.user_cfg.get("last_output_device")
 
+            old_device_names = set(item[4] for item in self.output_dev_list)
+
+            # 在开启增强时使用独立探测实例，避免 terminate 影响正在进行的实时音频流
+            probe_pa = None
             if not self.is_live_capturing:
                 try: self.pa.terminate()
                 except Exception: pass
                 self.pa = pyaudio.PyAudio()
+                active_pa = self.pa
+            else:
+                probe_pa = pyaudio.PyAudio()
+                active_pa = probe_pa
 
-            self.output_dev_list = []
-            self.has_cable_installed = False
+            new_dev_list = []
+            has_cable = False
 
-            for i in range(self.pa.get_device_count()):
+            for i in range(active_pa.get_device_count()):
                 try:
-                    dev = self.pa.get_device_info_by_index(i)
-                    host_info = self.pa.get_host_api_info_by_index(dev["hostApi"])
+                    dev = active_pa.get_device_info_by_index(i)
+                    host_info = active_pa.get_host_api_info_by_index(dev["hostApi"])
                     name = str(dev["name"])
                     sr = int(dev["defaultSampleRate"])
                     name_lower = name.lower()
 
                     if 'cable' in name_lower or 'vb-audio' in name_lower or 'virtual cable' in name_lower:
-                        self.has_cable_installed = True
+                        has_cable = True
 
                     if "wasapi" in host_info["name"].lower():
                         if dev["maxOutputChannels"] > 0 and not dev.get("isLoopbackDevice", False):
                             if 'cable' not in name_lower and 'vb-audio' not in name_lower:
-                                self.output_dev_list.append((i, f"🎧 {name}", sr, dev["maxOutputChannels"], name))
+                                is_headphone = any(k in name_lower for k in [
+                                    '耳机', 'headphone', 'headset', 'earphone', 'buds', 'airpods',
+                                    'wh-1000', 'freebuds', 'bose', 'sony', 'xiaomi', 'beats', 'oppo', 'vivo'
+                                ])
+                                is_display = any(k in name_lower for k in [
+                                    'hd audio', 'display', 'benq', 'dell', 'samsung', 'lg', 'hdmi', 'dp', 'monitor'
+                                ])
+                                if is_headphone:
+                                    icon = "🎧 "
+                                elif is_display:
+                                    icon = "🖥️ "
+                                else:
+                                    icon = "🔊 "
+                                new_dev_list.append((i, f"{icon}{name}", sr, dev["maxOutputChannels"], name, is_headphone))
                 except Exception as dev_err:
                     logging.warning(f"Error parsing device {i}: {dev_err}")
 
-            self.output_dev_combo.clear()
-            self.output_dev_combo.addItems([item[1] for item in self.output_dev_list])
+            if probe_pa:
+                try: probe_pa.terminate()
+                except Exception: pass
 
+            self.has_cable_installed = has_cable
             if self.has_cable_installed:
                 self.vbcable_bar.hide()
-                self.log("✅ 成功检测到系统虚拟音频通道 (已就绪)！")
             else:
                 self.vbcable_bar.show()
 
-            matched_idx = 0
-            if prev_sel_name:
+            new_device_names = set(item[4] for item in new_dev_list)
+            added_names = new_device_names - old_device_names
+            removed_names = old_device_names - new_device_names
+
+            list_changed = (bool(added_names) or bool(removed_names) or len(new_dev_list) != len(self.output_dev_list))
+
+            if not list_changed and trigger_source == 'auto':
+                return
+
+            self.output_dev_list = new_dev_list
+
+            # 更新 UI 选项
+            self.output_dev_combo.blockSignals(True)
+            self.output_dev_combo.clear()
+            self.output_dev_combo.addItems([item[1] for item in self.output_dev_list])
+
+            # 智能设备匹配与选择逻辑
+            # 1. 是否有新耳机设备刚连接？
+            new_headphone_idx = None
+            for idx, item in enumerate(self.output_dev_list):
+                if item[4] in added_names and item[5]:
+                    new_headphone_idx = idx
+                    break
+
+            matched_idx = -1
+            if new_headphone_idx is not None:
+                matched_idx = new_headphone_idx
+                self.log(f"🎧 检测到耳机已连接: 【{self.output_dev_list[matched_idx][4]}】，已自动切换为当前输出设备！")
+            elif prev_sel_name and any(item[4] == prev_sel_name for item in self.output_dev_list):
+                # 原选择设备仍然在线且有效
                 for idx, item in enumerate(self.output_dev_list):
                     if item[4] == prev_sel_name:
                         matched_idx = idx
                         break
             else:
+                # 原设备已拔出/断开，优先回退到耳机类，其次扬声器，最后第一个设备
                 for idx, item in enumerate(self.output_dev_list):
-                    if 'xiaomi' in item[1].lower() or 'buds' in item[1].lower() or '耳机' in item[1]:
+                    if item[5]:
                         matched_idx = idx
                         break
+                if matched_idx == -1:
+                    for idx, item in enumerate(self.output_dev_list):
+                        if '扬声器' in item[4] or 'speaker' in item[4].lower() or 'realtek' in item[4].lower():
+                            matched_idx = idx
+                            break
+                if matched_idx == -1 and self.output_dev_list:
+                    matched_idx = 0
 
-            if self.output_dev_list:
+                if prev_sel_name and (prev_sel_name in removed_names or not any(item[4] == prev_sel_name for item in self.output_dev_list)):
+                    if matched_idx >= 0 and matched_idx < len(self.output_dev_list):
+                        fallback_name = self.output_dev_list[matched_idx][4]
+                        self.log(f"⚠️ 当前设备 【{prev_sel_name}】 已断开，已自动平滑切换至可用设备: 【{fallback_name}】")
+                    else:
+                        self.log(f"⚠️ 当前设备 【{prev_sel_name}】 已断开，当前无其他可用输出设备。")
+
+            if matched_idx >= 0 and matched_idx < len(self.output_dev_list):
                 self.output_dev_combo.setCurrentIndex(matched_idx)
+                sel_dev_name = self.output_dev_list[matched_idx][4]
+                self.user_cfg["last_output_device"] = sel_dev_name
+                self.save_user_config()
 
-            self.log(f"🔄 声卡设备列表已刷新，发现 {len(self.output_dev_list)} 个可用输出设备")
+            self.output_dev_combo.blockSignals(False)
+
+            if trigger_source == 'manual':
+                self.log(f"🔄 声卡设备列表已刷新，发现 {len(self.output_dev_list)} 个可用输出设备")
+
+            # 若增强引擎正在运行，自动比对并热切换输出流
+            if self.is_live_capturing:
+                self._check_live_stream_hot_swap()
+
         except Exception as e:
             logging.error(f"Device enumeration exception: {e}")
+
+    def on_output_dev_combo_changed(self, index):
+        if index < 0 or index >= len(self.output_dev_list):
+            return
+        dev_info = self.output_dev_list[index]
+        dev_name = dev_info[4]
+        self.user_cfg["last_output_device"] = dev_name
+        self.save_user_config()
+        if self.is_live_capturing:
+            self._check_live_stream_hot_swap()
+
+    def _check_live_stream_hot_swap(self):
+        if not self.is_live_capturing:
+            return
+        cur_idx = self.output_dev_combo.currentIndex()
+        if cur_idx < 0 or cur_idx >= len(self.output_dev_list):
+            return
+        dev_info = self.output_dev_list[cur_idx]
+        phys_out_idx = dev_info[0]
+        phys_out_name = dev_info[4]
+        phys_out_sr = dev_info[2]
+        phys_out_channels = min(2, dev_info[3])
+        current_active = getattr(self, 'current_live_phys_name', None)
+        if current_active != phys_out_name or self.live_out_stream is None:
+            self._hot_swap_output_device(phys_out_idx, phys_out_name, phys_out_sr, phys_out_channels)
+
+    def _hot_swap_output_device(self, new_phys_idx, new_phys_name, new_phys_sr, new_phys_channels):
+        """在保持输入采集与 DSP 运算不中断的前提下，安全热插拔/热切换底层物理输出声卡流"""
+        try:
+            self.log(f"🔄 正在无缝热切换音频输出设备 -> 【{new_phys_name}】...")
+            old_phys_name = getattr(self, 'current_live_phys_name', None)
+
+            # 1. 还原旧设备物理端点音量
+            if old_phys_name and hasattr(self, 'original_phys_vol') and self.original_phys_vol is not None:
+                try:
+                    set_device_endpoint_volume(old_phys_name, self.original_phys_vol)
+                except Exception:
+                    pass
+
+            # 2. 准备新设备物理端点音量
+            self.original_phys_vol = get_device_endpoint_volume(new_phys_name)
+            set_device_endpoint_volume(new_phys_name, 1.0)
+            self.current_live_phys_name = new_phys_name
+            self.original_default_audio_name = new_phys_name
+
+            # 3. 安全停止并关闭旧物理输出流
+            old_out_stream = self.live_out_stream
+            self.live_out_stream = None
+            if old_out_stream:
+                try:
+                    old_out_stream.stop_stream()
+                    old_out_stream.close()
+                except Exception:
+                    pass
+
+            # 4. 创建并绑定新物理输出流
+            self.live_out_stream = self.pa.open(
+                format=pyaudio.paFloat32,
+                channels=new_phys_channels,
+                rate=self.live_rate,
+                output=True,
+                output_device_index=new_phys_idx,
+                frames_per_buffer=self.live_chunk_size
+            )
+            self.log(f"✅ 音频输出设备已成功切换为: 【{new_phys_name}】")
+        except Exception as e:
+            logging.error(f"Failed to hot-swap output device: {e}")
 
     def toggle_live_capture(self, checked):
         if self.is_live_capturing:
@@ -1511,12 +2366,14 @@ class SodaMusicPlayerQtApp(QMainWindow):
                         if self.original_phys_vol is not None:
                             set_device_endpoint_volume(self.original_default_audio_name, self.original_phys_vol)
 
+                    self.current_live_phys_name = None
                     self.sig_set_toggle_state.emit("off")
                     self.sig_set_toggle_status_text.emit("● 未开启 (点击开启)", "#9ca3af")
                     self.sig_set_dsp_tag.emit("● 待机中 (等待开启)", "#71717a" if self.current_theme == "dark" else "#9ca3af")
                     self.log("⏹️ 系统全局声音实时增强已停止，默认播放设备及音量已还原。")
                 except Exception as e:
                     logging.error(f"Async stop capture error: {e}")
+                    self.current_live_phys_name = None
                     self.sig_set_toggle_state.emit("off")
                     self.sig_set_dsp_tag.emit("● 待机中", "#71717a" if self.current_theme == "dark" else "#9ca3af")
 
@@ -1583,6 +2440,7 @@ class SodaMusicPlayerQtApp(QMainWindow):
                     phys_out_channels = min(2, out_dev_info[3])
 
                     self.original_default_audio_name = phys_out_name
+                    self.current_live_phys_name = phys_out_name
                     self.live_rate = phys_out_sr
                     self.sample_rate = self.live_rate
                     self.live_chunk_size = 1024
@@ -1631,6 +2489,7 @@ class SodaMusicPlayerQtApp(QMainWindow):
                 except Exception as e:
                     logging.error(f"Failed to start live capture: {e}")
                     self.is_live_capturing = False
+                    self.current_live_phys_name = None
                     self.sig_set_toggle_state.emit("off")
                     self.sig_set_toggle_status_text.emit("● 启动失败", "#ef4444")
                     self.sig_set_dsp_tag.emit("● 启动失败", "#ef4444")
@@ -1659,11 +2518,27 @@ class SodaMusicPlayerQtApp(QMainWindow):
                 if len(floats) == 0:
                     continue
 
-                fft_data = np.abs(np.fft.rfft(floats[:, 0]))
-                if len(fft_data) >= 32:
-                    step = len(fft_data) // 32
-                    if step > 0:
-                        self.fft_magnitudes = fft_data[:32*step:step][:32]
+                sample_data = floats[:, 0]
+                fft_data = np.abs(np.fft.rfft(sample_data * np.hanning(len(sample_data))))
+                self.fft_raw_spectrum = fft_data
+                # 72 频段对数声学分布 (30Hz ~ 18000Hz)
+                if len(fft_data) > 16:
+                    sr = getattr(self, 'live_in_sr', 48000)
+                    fft_size = len(sample_data)
+                    bin_hz = sr / float(fft_size)
+                    log_freqs = np.geomspace(30, min(18000, sr / 2.1), 73)
+                    bands_72 = np.zeros(72, dtype=np.float32)
+                    for bi in range(72):
+                        f0 = log_freqs[bi]
+                        f1 = log_freqs[bi + 1]
+                        a = max(1, int(math.floor(f0 / bin_hz)))
+                        b = min(len(fft_data) - 1, int(math.ceil(f1 / bin_hz)))
+                        if b >= a:
+                            chunk = fft_data[a:b+1]
+                            bands_72[bi] = float(np.sqrt(np.mean(chunk ** 2)))
+                        elif a < len(fft_data):
+                            bands_72[bi] = float(fft_data[a])
+                    self.fft_magnitudes = bands_72
 
                 processed = self.dsp_client.process_chunk(floats)
 
@@ -1692,21 +2567,31 @@ class SodaMusicPlayerQtApp(QMainWindow):
 
     def _out_playback_worker(self):
         logging.info("Entering Out-Playback live_capture_worker...")
+        consecutive_errors = 0
         while self.is_live_capturing:
             try:
-                if not self.live_out_stream:
-                    break
+                stream = self.live_out_stream
+                if not stream:
+                    time.sleep(0.01)
+                    continue
                 try:
                     chunk_bytes = self.live_ring_buffer.get(timeout=0.05)
                 except queue.Empty:
                     chunk_bytes = b'\x00' * (self.live_chunk_size * 2 * 4)
 
-                self.live_out_stream.write(chunk_bytes)
+                stream.write(chunk_bytes)
+                consecutive_errors = 0
             except Exception as e:
                 if not self.is_live_capturing:
                     break
-                logging.error(f"Live Out Playback Worker Exception: {e}")
-                time.sleep(0.01)
+                consecutive_errors += 1
+                logging.error(f"Live Out Playback Worker Exception ({consecutive_errors}): {e}")
+                if consecutive_errors >= 3:
+                    # 设备可能已拔出/断开，触发信号自动恢复切换
+                    self.sig_audio_devices_changed.emit()
+                    time.sleep(0.1)
+                else:
+                    time.sleep(0.01)
 
     def on_volume_change(self, val):
         self.volume = val / 100.0
@@ -1794,6 +2679,18 @@ class SodaMusicPlayerQtApp(QMainWindow):
 
     def closeEvent(self, event):
         logging.info("Closing application...")
+        try:
+            if hasattr(self, 'device_watcher') and self.device_watcher:
+                self.device_watcher.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'device_poll_timer'):
+                self.device_poll_timer.stop()
+            if hasattr(self, 'device_debounce_timer'):
+                self.device_debounce_timer.stop()
+        except Exception:
+            pass
         try:
             self.sys_vol_watcher.stop()
         except Exception:

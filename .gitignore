@@ -1,7 +1,8 @@
-﻿# Logs
+# Logs
 *.log
-soda_player.log
-dsp_server.log
+*.log.*
+soda_player.log*
+dsp_server.log*
 
 # Python cache
 __pycache__/

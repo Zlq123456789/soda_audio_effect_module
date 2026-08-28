@@ -1,16 +1,20 @@
 {
-  "volume": 8,
+  "volume": 14,
   "effect": "6_hifi_live",
   "intensities": {
-    "1_intelligent": 200,
-    "2_surround_360": 100,
+    "1_intelligent": 0,
+    "2_surround_360": 200,
     "3_deep_bass": 200,
-    "4_clear_vocal": 100,
+    "4_clear_vocal": 2,
     "5_sound_3d": 100,
-    "6_hifi_live": 138,
+    "6_hifi_live": 200,
     "7_dynamic_electro": 100,
     "8_rock_music": 100,
     "9_vintage_record": 100
   },
-  "theme": "dark"
+  "theme": "dark",
+  "bg_mode": "galaxy",
+  "card_translucent": true,
+  "bg_blur": false,
+  "last_output_device": "耳机 (Xiaomi Buds 4)"
 }
