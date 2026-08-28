@@ -5,7 +5,14 @@
 [![Release](https://img.shields.io/badge/Release-v1.0.0-blue.svg)](https://github.com/Zlq123456789/soda_audio_effect_module/releases)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20x64-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)]()
-[![GUI](https://img.shields.io/badge/GUI-Qt6%20%2F%20PySide6-purple.svg)]()
+[![License](https://img.shields.io/badge/License-Non--Commercial-red.svg)]()
+
+---
+
+> ### ⚠️ 【重要免责与非商用声明】
+> 1. 本项目及其所有源代码、调音预设、二进制组件及构建产物**仅供个人学习、音频技术交流与非商业性研究使用**。
+> 2. **严禁任何个人或组织将本项目（及任何二次打包/衍生版本）用于商业用途、付费售卖、捆绑推广、二次分发牟利或任何形式的商业传播**。
+> 3. 使用者因违反本声明而产生的任何法律责任或纠纷，均由使用者自行承担，与本项目原作者无关。
 
 ---
 
@@ -42,8 +49,8 @@
 
 ### 1. 下载即用
 从 [Releases 页面](https://github.com/Zlq123456789/soda_audio_effect_module/releases) 下载最新发行包：
-- **音效管理_v1.0.0_免安装绿色版.zip**（推荐，解压即用，零启动延迟）
-- **音效管理_v1.0.0_单文件独立EXE版.zip**（单文件可执行封装）
+- **Soda_Audio_Effect_v1.0.0_Portable.zip**（免安装绿色版，推荐，解压即用，零启动延迟）
+- **Soda_Audio_Effect_v1.0.0_Standalone_EXE.zip**（单文件独立 EXE 版）
 
 ### 2. 运行与接管
 1. 解压后双击运行 **音效管理.exe**。
@@ -69,6 +76,6 @@ soda_audio_effect_module/
 
 ---
 
-## 📄 开源许可证
+## 📄 开源许可证与条款
 
-本项目基于 MIT 协议分发与使用。
+本项目仅限**非商业学习交流用途 (Non-Commercial Use Only)**，严禁任何商业盈利行为。
