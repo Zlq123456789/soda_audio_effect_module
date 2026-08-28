@@ -21,3 +21,9 @@ yarn-error.log*
 Thumbs.db
 .vscode/
 .idea/
+
+# Builds & Releases
+build/
+dist/
+release_*/
+*.spec
