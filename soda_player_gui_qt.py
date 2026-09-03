@@ -16,6 +16,11 @@ import queue
 import subprocess
 import ctypes
 import math
+import wave
+import secrets
+import hashlib
+import hmac
+import winreg
 import numpy as np
 import pyaudiowpatch as pyaudio
 
@@ -37,21 +42,23 @@ except Exception:
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
     from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal, Slot, QPropertyAnimation, Property
-    from PySide6.QtGui import QColor, QPainter, QLinearGradient, QRadialGradient, QBrush, QPen, QFont, QIcon, QPixmap
+    from PySide6.QtGui import QColor, QPainter, QLinearGradient, QRadialGradient, QBrush, QPen, QFont, QIcon, QPixmap, QAction, QPalette
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
         QLabel, QPushButton, QComboBox, QScrollArea, QFrame, QMessageBox, QSizePolicy,
-        QStackedLayout
+        QStackedLayout, QSystemTrayIcon, QMenu
     )
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
 except ImportError:
     from PyQt6 import QtCore, QtGui, QtWidgets
     from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, pyqtSignal as Signal, pyqtSlot as Slot, QPropertyAnimation, pyqtProperty as Property
-    from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QRadialGradient, QBrush, QPen, QFont, QIcon, QPixmap
+    from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QRadialGradient, QBrush, QPen, QFont, QIcon, QPixmap, QAction, QPalette
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
         QLabel, QPushButton, QComboBox, QScrollArea, QFrame, QMessageBox, QSizePolicy,
-        QStackedLayout
+        QStackedLayout, QSystemTrayIcon, QMenu
     )
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
@@ -61,7 +68,9 @@ else:
 PRESETS_DIR = os.path.join(BASE_DIR, 'presets')
 DSP_SERVER_PATH = os.path.join(BASE_DIR, 'dsp_server.mjs')
 VBCABLE_SETUP_EXE = os.path.join(BASE_DIR, 'tools', 'vbcable', 'VBCABLE_Setup_x64.exe')
-NIRCMD_EXE = os.path.join(BASE_DIR, 'tools', 'nircmd', 'nircmdc.exe')
+NIRCMD_EXE = os.path.join(BASE_DIR, 'tools', 'nircmd', 'nircmd.exe')
+if not os.path.exists(NIRCMD_EXE):
+    NIRCMD_EXE = os.path.join(BASE_DIR, 'tools', 'nircmd', 'nircmdc.exe')
 ICON_PATH = os.path.join(BASE_DIR, 'app_icon.ico')
 PNG_PATH = os.path.join(BASE_DIR, 'app_icon.png')
 LOG_FILE = os.path.join(BASE_DIR, 'soda_player.log')
@@ -77,6 +86,66 @@ fh = RotatingFileHandler(LOG_FILE, maxBytes=1024 * 1024, backupCount=1, encoding
 fh.setLevel(logging.INFO)
 fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
 root_logger.addHandler(fh)
+
+def ensure_feedback_sound_files():
+    """生成柔和温润的开启/关闭物理声学提示音 (44.1kHz 16bit PCM WAV)"""
+    try:
+        assets_dir = os.path.join(BASE_DIR, 'assets')
+        os.makedirs(assets_dir, exist_ok=True)
+        path_on = os.path.join(assets_dir, 'sound_on.wav')
+        path_off = os.path.join(assets_dir, 'sound_off.wav')
+
+        sr = 44100
+        # 开启提示音: 柔和双音上扬水滴铃音 (D5 587.33Hz -> A5 880Hz)
+        if not os.path.exists(path_on):
+            t1, t2 = 0.10, 0.22
+            n1, n2 = int(sr * t1), int(sr * t2)
+            time1 = np.linspace(0, t1, n1, False)
+            attack1 = np.sin(np.pi * np.clip(time1 / 0.015, 0, 0.5))
+            decay1 = np.exp(-time1 * 14)
+            env1 = attack1 * decay1
+            tone1 = (0.85 * np.sin(2 * np.pi * 587.33 * time1) + 0.15 * np.sin(2 * np.pi * 1174.66 * time1)) * env1
+
+            time2 = np.linspace(0, t2, n2, False)
+            attack2 = np.sin(np.pi * np.clip(time2 / 0.015, 0, 0.5))
+            decay2 = np.exp(-time2 * 7)
+            env2 = attack2 * decay2
+            tone2 = (0.88 * np.sin(2 * np.pi * 880.0 * time2) + 0.12 * np.sin(2 * np.pi * 1760.0 * time2)) * env2
+            sig_on = np.concatenate([tone1, tone2]) * 0.22  # 柔和舒适音量
+            audio_on = (sig_on * 32767).astype(np.int16)
+            with wave.open(path_on, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(audio_on.tobytes())
+
+        # 关闭提示音: 柔和下行水滴音 (A5 880Hz -> D5 587.33Hz)
+        if not os.path.exists(path_off):
+            t1, t2 = 0.10, 0.22
+            n1, n2 = int(sr * t1), int(sr * t2)
+            time1 = np.linspace(0, t1, n1, False)
+            attack1 = np.sin(np.pi * np.clip(time1 / 0.015, 0, 0.5))
+            decay1 = np.exp(-time1 * 14)
+            env1 = attack1 * decay1
+            tone1 = (0.88 * np.sin(2 * np.pi * 880.0 * time1) + 0.12 * np.sin(2 * np.pi * 1760.0 * time1)) * env1
+
+            time2 = np.linspace(0, t2, n2, False)
+            attack2 = np.sin(np.pi * np.clip(time2 / 0.015, 0, 0.5))
+            decay2 = np.exp(-time2 * 7)
+            env2 = attack2 * decay2
+            tone2 = (0.85 * np.sin(2 * np.pi * 587.33 * time2) + 0.15 * np.sin(2 * np.pi * 1174.66 * time2)) * env2
+            sig_off = np.concatenate([tone1, tone2]) * 0.20  # 柔和舒适音量
+            audio_off = (sig_off * 32767).astype(np.int16)
+            with wave.open(path_off, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(audio_off.tobytes())
+    except Exception as e:
+        logging.warning(f"Failed to generate feedback sounds: {e}")
+
+# 启动时确保提示音音频就绪
+ensure_feedback_sound_files()
 
 EFFECT_DEFS = [
     {"key": "none", "name": "原声直通", "desc": "完全绕过 DSP，纯净直通输出"},
@@ -189,6 +258,24 @@ def apply_studio_soft_limiter(audio_chunk):
         audio_chunk[mask] = np.sign(audio_chunk[mask]) * compressed
     return audio_chunk
 
+def resample_audio_chunk(audio_chunk, src_rate, dst_rate):
+    """高质量极速双通道音频重采样插值 (C-level numpy 线性插值，耗时 < 0.03ms)"""
+    if src_rate == dst_rate or audio_chunk is None or len(audio_chunk) == 0:
+        return audio_chunk
+    in_len = len(audio_chunk)
+    out_len = int(round(in_len * (float(dst_rate) / float(src_rate))))
+    if out_len <= 0:
+        return audio_chunk
+    x_in = np.linspace(0, 1, in_len, endpoint=False)
+    x_out = np.linspace(0, 1, out_len, endpoint=False)
+    if audio_chunk.ndim == 2:
+        out = np.empty((out_len, audio_chunk.shape[1]), dtype=np.float32)
+        for ch in range(audio_chunk.shape[1]):
+            out[:, ch] = np.interp(x_out, x_in, audio_chunk[:, ch])
+        return out
+    else:
+        return np.interp(x_out, x_in, audio_chunk).astype(np.float32)
+
 def apply_windows_dark_title_bar(hwnd, enable_dark=True):
     """设置 Windows 10/11 原生标题栏深色/浅色主题 (完美消除白顶或黑顶割裂感)"""
     try:
@@ -204,15 +291,237 @@ def apply_windows_dark_title_bar(hwnd, enable_dark=True):
         pass
 
 
+from ctypes import wintypes
+from comtypes import COMObject, CoInitialize, CoUninitialize, GUID, IUnknown
+import comtypes.client
+import pycaw.pycaw as pc
+
+
+class WindowsAudioPolicyHelper:
+    """Windows Core Audio IPolicyConfig 接口封装：动态控制虚拟声卡在系统输出列表中的显示与隐藏"""
+    _cached_punk = None
+    _cached_vtable = None
+    _method14 = None
+
+    @classmethod
+    def get_interface(cls):
+        if cls._cached_punk is not None and cls._method14 is not None:
+            return cls._cached_punk, cls._method14
+
+        if sys.platform != 'win32':
+            return None, None
+
+        clsids = [
+            GUID('{870af99c-171d-4f9e-af0d-e63df40c2bc9}'),
+            GUID('{294fcb26-abda-4f4a-9121-a4869b35177e}')
+        ]
+        iids = [
+            '{e8478600-a74b-4b3a-a96b-1fc3e796fc46}', # Windows 11 24H2 / build 26000+
+            '{f8679f50-850a-4129-9dc1-4f7380902446}', # Windows 10 1607 - 21H2, Win11 21H2-23H2
+            '{6be11520-230a-4f39-95c5-5d30007d3942}', # Windows 7/8
+            '{8f9fbda0-7439-421a-bc07-d5119783e2d3}',
+            '{ab21ac81-28f1-4d33-ac58-511512467d45}',
+            '{c2f310d4-9b0d-4bf9-b516-e5e5e8e50b82}'
+        ]
+        
+        for clsid in clsids:
+            try:
+                obj = comtypes.client.CreateObject(clsid, interface=IUnknown)
+                for iid_str in iids:
+                    try:
+                        punk = obj.QueryInterface(IUnknown, GUID(iid_str))
+                        vtable = ctypes.cast(punk, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+                        proto = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, wintypes.LPCWSTR, wintypes.BOOL)
+                        method14 = proto(vtable[14])
+                        cls._cached_punk = punk
+                        cls._cached_vtable = vtable
+                        cls._method14 = method14
+                        return punk, method14
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        # 兜底：动态扫描 MMDevAPI.dll 中的可用 GUID
+        try:
+            mmdev_path = os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'System32', 'MMDevAPI.dll')
+            if os.path.exists(mmdev_path):
+                with open(mmdev_path, 'rb') as f:
+                    data = f.read()
+                obj = comtypes.client.CreateObject(clsids[0], interface=IUnknown)
+                for offset in range(0, len(data) - 16, 4):
+                    chunk = data[offset:offset+16]
+                    d1, d2, d3 = struct.unpack('<IHH', chunk[:8])
+                    d4 = chunk[8:]
+                    guid_str = f'{{{d1:08x}-{d2:04x}-{d3:04x}-{d4[:2].hex()}-{d4[2:].hex()}}}'
+                    try:
+                        g = GUID(guid_str)
+                        punk = obj.QueryInterface(IUnknown, g)
+                        vtable = ctypes.cast(punk, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+                        proto = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, wintypes.LPCWSTR, wintypes.BOOL)
+                        method14 = proto(vtable[14])
+                        cls._cached_punk = punk
+                        cls._cached_vtable = vtable
+                        cls._method14 = method14
+                        return punk, method14
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return None, None
+
+    @classmethod
+    def set_endpoint_visibility(cls, dev_id, visible=True):
+        punk, func = cls.get_interface()
+        if punk and func:
+            try:
+                hr = func(punk, dev_id, visible)
+                return hr == 0
+            except Exception as e:
+                logging.debug(f"Error setting endpoint visibility: {e}")
+        return False
+
+    @classmethod
+    def is_cable_installed(cls):
+        """检查系统中是否已安装虚拟声卡驱动 (多维深度探测：注册表 + 驱动服务 + Core Audio 全端点)"""
+        # 1. Windows 注册表快速高可靠检测 (驱动软件与卸载注册表，即使虚拟声卡处于隐藏/禁用状态也能精准识别)
+        try:
+            reg_paths = [
+                (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\VB-Audio\Cable'),
+                (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\VB-Audio'),
+                (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\WOW6432Node\VB-Audio\Cable'),
+                (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\WOW6432Node\VB-Audio'),
+            ]
+            for root, path in reg_paths:
+                try:
+                    k = winreg.OpenKey(root, path)
+                    winreg.CloseKey(k)
+                    return True
+                except Exception:
+                    pass
+
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+            for i in range(winreg.QueryInfoKey(k)[0]):
+                try:
+                    sub = winreg.EnumKey(k, i)
+                    if 'vbcable' in sub.lower() or 'vb:vbcable' in sub.lower() or 'vb-audio' in sub.lower():
+                        winreg.CloseKey(k)
+                        return True
+                except WindowsError:
+                    break
+            winreg.CloseKey(k)
+        except Exception:
+            pass
+
+        # 2. Windows Core Audio 终结点探测 (兜底检测)
+        try:
+            CoInitialize()
+            try:
+                CLSID_MMDeviceEnumerator = GUID('{BCDE0395-E52F-467C-8E3D-C4579291692E}')
+                enumerator = comtypes.client.CreateObject(CLSID_MMDeviceEnumerator, interface=pc.IMMDeviceEnumerator)
+                collection = enumerator.EnumAudioEndpoints(2, 0xF)
+                for i in range(collection.GetCount()):
+                    imm_dev = collection.Item(i)
+                    dev = pc.AudioUtilities.CreateDevice(imm_dev)
+                    name = (dev.FriendlyName or '').lower()
+                    del dev
+                    del imm_dev
+                    if 'cable' in name or 'vb-audio' in name:
+                        del collection
+                        del enumerator
+                        return True
+                del collection
+                del enumerator
+            finally:
+                CoUninitialize()
+        except Exception:
+            pass
+        return False
+
+    @classmethod
+    def set_virtual_cable_visibility(cls, visible=True):
+        """
+        设置虚拟声卡在 Windows 任务栏声音输出列表中的显示/隐藏状态：
+        - visible=True: 开启 CABLE Input 与 CABLE Output
+        - visible=False: 关闭/隐藏 CABLE Input 和 CABLE In 16 Ch (使其完全从 Windows 声音输出列表中退出)
+        - CABLE In 16 Ch 始终保持隐藏
+        """
+        try:
+            CoInitialize()
+            try:
+                CLSID_MMDeviceEnumerator = GUID('{BCDE0395-E52F-467C-8E3D-C4579291692E}')
+                enumerator = comtypes.client.CreateObject(CLSID_MMDeviceEnumerator, interface=pc.IMMDeviceEnumerator)
+                collection = enumerator.EnumAudioEndpoints(2, 0xF)
+                count = collection.GetCount()
+                for i in range(count):
+                    imm_dev = collection.Item(i)
+                    dev = pc.AudioUtilities.CreateDevice(imm_dev)
+                    name = (dev.FriendlyName or '').lower()
+                    dev_id = dev.id
+                    del dev
+                    del imm_dev
+                    if 'cable in 16' in name:
+                        cls.set_endpoint_visibility(dev_id, False)
+                    elif 'cable input' in name:
+                        cls.set_endpoint_visibility(dev_id, visible)
+                del collection
+                del enumerator
+            finally:
+                CoUninitialize()
+        except Exception as e:
+            logging.debug(f"set_virtual_cable_visibility error: {e}")
+
+
+class WindowsAudioEndpointVolumeCallback(COMObject):
+    """Core Audio IAudioEndpointVolumeCallback 原生被动通知实现类 (0 轮询开销)"""
+    _com_interfaces_ = [pc.IAudioEndpointVolumeCallback]
+
+    def __init__(self, watcher):
+        super().__init__()
+        self.watcher = watcher
+
+    def OnNotify(self, pNotify):
+        if self.watcher and pNotify:
+            try:
+                v = float(pNotify.contents.fMasterVolume)
+                m = bool(pNotify.contents.bMuted)
+                self.watcher._on_endpoint_notify(v, m)
+            except Exception:
+                pass
+
+
 class SystemVolumeWatcher:
-    """Windows 系统全局主音量实时监听器（毫秒级同步任务栏与键盘音量键变化）"""
-    def __init__(self):
-        self.sys_vol = 1.0
+    """Windows 系统全局主音量实时监听器（毫秒级事件驱动，0% CPU 开销，支持物理/虚拟双通道监听）"""
+    def __init__(self, callback_on_vol_change=None):
+        self.sys_vol = 0.50
         self.sys_muted = False
         self.running = False
         self.thread = None
+        self._callbacks = []
+        self._endpoints = []
+        self.callback_on_vol_change = callback_on_vol_change
+        self.phys_device_name = None
+
+        # 启动时立即同步读取一次系统真实主音量
+        try:
+            CoInitialize()
+            try:
+                speakers = pc.AudioUtilities.GetSpeakers()
+                if speakers and hasattr(speakers, 'EndpointVolume') and speakers.EndpointVolume:
+                    self.sys_vol = float(speakers.EndpointVolume.GetMasterVolumeLevelScalar())
+                    self.sys_muted = bool(speakers.EndpointVolume.GetMute())
+            finally:
+                CoUninitialize()
+        except Exception:
+            pass
+
+    def set_phys_device(self, name):
+        self.phys_device_name = name
 
     def start(self):
+        if self.running:
+            return
         self.running = True
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
@@ -226,31 +535,76 @@ class SystemVolumeWatcher:
                 pass
             self.thread = None
 
+    def reconnect(self):
+        """当声卡设备变更时重新绑定系统主音量回调"""
+        if self.running:
+            self.stop()
+            self.start()
+
+    def _on_endpoint_notify(self, vol, muted):
+        self.sys_vol = float(vol)
+        self.sys_muted = bool(muted)
+        if self.callback_on_vol_change:
+            try:
+                self.callback_on_vol_change(self.sys_vol)
+            except Exception:
+                pass
+
     def _worker(self):
         try:
-            from comtypes import CoInitialize, CoUninitialize
-            import pycaw.pycaw as pc
-            CoInitialize()
+            # 使用 MTA (COINIT_MULTITHREADED) 初始化 COM 公寓，以便由 Windows 线程池直接派发 IAudioEndpointVolumeCallback
+            ctypes.windll.ole32.CoInitializeEx(None, 0)
             try:
+                self._endpoints.clear()
+                self._callbacks.clear()
+
+                # 监听系统默认输出端点 (运行状态下为 CABLE Input，待机状态下为物理默认设备)
+                try:
+                    speakers = pc.AudioUtilities.GetSpeakers()
+                    if speakers and hasattr(speakers, 'EndpointVolume') and speakers.EndpointVolume:
+                        ep = speakers.EndpointVolume
+                        self.sys_vol = float(ep.GetMasterVolumeLevelScalar())
+                        self.sys_muted = bool(ep.GetMute())
+                        cb = WindowsAudioEndpointVolumeCallback(self)
+                        ep.RegisterControlChangeNotify(cb)
+                        self._endpoints.append(ep)
+                        self._callbacks.append(cb)
+                except Exception as e:
+                    logging.debug(f"GetSpeakers watcher error: {e}")
+
+                logging.info(f"SystemVolumeWatcher: registered endpoint callback (initial vol: {self.sys_vol*100:.1f}%).")
+
+                # 双保险机制：被动通知 + 80ms 极低开销轮询，杜绝任何按键或系统滑块事件丢失
                 while self.running:
                     try:
-                        speakers = pc.AudioUtilities.GetSpeakers()
-                        if speakers and hasattr(speakers, 'EndpointVolume'):
-                            ep = speakers.EndpointVolume
-                            self.sys_vol = float(ep.GetMasterVolumeLevelScalar())
-                            self.sys_muted = bool(ep.GetMute())
+                        if self._endpoints:
+                            ep = self._endpoints[0]
+                            cur_v = float(ep.GetMasterVolumeLevelScalar())
+                            cur_m = bool(ep.GetMute())
+                            if abs(cur_v - self.sys_vol) > 0.005 or cur_m != self.sys_muted:
+                                self.sys_vol = cur_v
+                                self.sys_muted = cur_m
+                                if self.callback_on_vol_change:
+                                    try: self.callback_on_vol_change(self.sys_vol)
+                                    except Exception: pass
                     except Exception:
                         pass
-                    time.sleep(0.04)
+                    time.sleep(0.08)
             finally:
-                CoUninitialize()
+                for ep, cb in zip(self._endpoints, self._callbacks):
+                    try:
+                        ep.UnregisterControlChangeNotify(cb)
+                    except Exception:
+                        pass
+                self._endpoints.clear()
+                self._callbacks.clear()
+                speakers = None
+                ep = None
+                cb = None
+                d = None
+                ctypes.windll.ole32.CoUninitialize()
         except Exception as e:
             logging.warning(f"SystemVolumeWatcher error: {e}")
-
-
-from ctypes import wintypes
-from comtypes import COMObject, CoInitialize, CoUninitialize
-import pycaw.pycaw as pc
 
 
 class WindowsAudioEndpointNotificationClient(COMObject):
@@ -303,12 +657,13 @@ class WindowsAudioDeviceWatcher:
 
     def _run(self):
         try:
-            CoInitialize()
+            # 使用 MTA (COINIT_MULTITHREADED) 初始化 COM 公寓，无需 Windows 消息循环即可由系统线程池直接派发 IMMNotificationClient 回调
+            ctypes.windll.ole32.CoInitializeEx(None, 0)
             try:
                 self._enumerator = pc.AudioUtilities.GetDeviceEnumerator()
                 self._client = WindowsAudioEndpointNotificationClient(self.on_change_callback)
                 self._enumerator.RegisterEndpointNotificationCallback(self._client)
-                logging.info("WindowsAudioDeviceWatcher: Core Audio IMMNotificationClient registered.")
+                logging.info("WindowsAudioDeviceWatcher: Core Audio IMMNotificationClient registered (MTA).")
                 while self.running:
                     time.sleep(0.5)
             finally:
@@ -317,7 +672,9 @@ class WindowsAudioDeviceWatcher:
                         self._enumerator.UnregisterEndpointNotificationCallback(self._client)
                     except Exception:
                         pass
-                CoUninitialize()
+                self._enumerator = None
+                self._client = None
+                ctypes.windll.ole32.CoUninitialize()
         except Exception as e:
             logging.warning(f"WindowsAudioDeviceWatcher exception: {e}")
 
@@ -331,50 +688,125 @@ class WindowsAudioDeviceWatcher:
             self.thread = None
 
 
-def get_active_render_device_signature():
-    """获取当前所有活动音频输出设备的轻量签名（用于心跳比对，耗时 < 5ms）"""
+def apply_dwm_dark_mode(hwnd, dark=True):
+    """为 Windows 10/11 窗口启用原生 DWM 沉浸式暗色标题栏，消除启动时的白框白条"""
+    if sys.platform == 'win32' and hwnd:
+        try:
+            val = ctypes.c_int(1 if dark else 0)
+            # Windows 10 (Build 19041+) 及 Windows 11: 属性编号 20
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                int(hwnd),
+                20,
+                ctypes.byref(val),
+                ctypes.sizeof(val)
+            )
+        except Exception:
+            try:
+                # 兼容 Windows 10 (Build 18985~19041): 属性编号 19
+                val = ctypes.c_int(1 if dark else 0)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    int(hwnd),
+                    19,
+                    ctypes.byref(val),
+                    ctypes.sizeof(val)
+                )
+            except Exception:
+                pass
+
+
+def get_active_render_device_names():
+    """获取 Windows Core Audio 中所有处于活动 (ACTIVE) 状态的输出设备名称集合"""
+    names = set()
     try:
         CoInitialize()
         try:
             enum = pc.AudioUtilities.GetDeviceEnumerator()
             collection = enum.EnumAudioEndpoints(pc.EDataFlow.eRender.value, pc.DEVICE_STATE.ACTIVE.value)
             count = collection.GetCount()
-            ids = []
             for i in range(count):
-                dev = collection.Item(i)
-                ids.append(dev.GetId())
-            return tuple(sorted(ids))
-        finally:
-            CoUninitialize()
-    except Exception:
-        return ()
-
-
-def get_device_endpoint_volume(device_name):
-    """获取指定物理声卡设备的系统音量标量 (0.0 ~ 1.0)"""
-    try:
-        CoInitialize()
-        try:
-            for dev in pc.AudioUtilities.GetAllDevices():
-                if device_name and (device_name.lower() in dev.FriendlyName.lower() or dev.FriendlyName.lower() in device_name.lower()):
-                    if hasattr(dev, 'EndpointVolume'):
-                        return float(dev.EndpointVolume.GetMasterVolumeLevelScalar())
+                imm_dev = collection.Item(i)
+                dev = pc.AudioUtilities.CreateDevice(imm_dev)
+                fname = dev.FriendlyName
+                if fname:
+                    names.add(str(fname))
+                del dev
+                del imm_dev
+            del collection
+            del enum
         finally:
             CoUninitialize()
     except Exception:
         pass
-    return None
+    return names
 
 
-def set_device_endpoint_volume(device_name, volume_scalar):
-    """设置指定物理声卡设备的系统音量标量 (0.0 ~ 1.0)"""
+def get_active_render_device_signature():
+    """获取当前所有活动音频输出设备的轻量签名（用于心跳比对，耗时 < 5ms）"""
+    names = get_active_render_device_names()
+    return tuple(sorted(names))
+
+
+def get_device_endpoint_volume(device_name):
+    """获取指定声卡设备的系统音量标量 (0.0 ~ 1.0)"""
+    vol = None
     try:
         CoInitialize()
         try:
-            for dev in pc.AudioUtilities.GetAllDevices():
-                if device_name and (device_name.lower() in dev.FriendlyName.lower() or dev.FriendlyName.lower() in device_name.lower()):
-                    if hasattr(dev, 'EndpointVolume'):
-                        dev.EndpointVolume.SetMasterVolumeLevelScalar(float(volume_scalar), None)
+            enum = pc.AudioUtilities.GetDeviceEnumerator()
+            col = enum.EnumAudioEndpoints(pc.EDataFlow.eRender.value, pc.DEVICE_STATE.ACTIVE.value)
+            count = col.GetCount()
+            for i in range(count):
+                try:
+                    imm_dev = col.Item(i)
+                    dev = pc.AudioUtilities.CreateDevice(imm_dev)
+                    fname = dev.FriendlyName or ''
+                    if device_name and (device_name.lower() in fname.lower() or fname.lower() in device_name.lower()):
+                        try:
+                            if hasattr(dev, 'EndpointVolume') and dev.EndpointVolume:
+                                vol = float(dev.EndpointVolume.GetMasterVolumeLevelScalar())
+                                break
+                        except Exception:
+                            pass
+                    del dev
+                    del imm_dev
+                except Exception:
+                    pass
+            del col
+            del enum
+        finally:
+            CoUninitialize()
+    except Exception:
+        pass
+    return vol
+
+
+def set_device_endpoint_volume(device_name, volume_scalar):
+    """设置指定声卡设备的系统音量标量 (0.0 ~ 1.0)"""
+    try:
+        volume_scalar = max(0.0, min(1.0, float(volume_scalar)))
+        CoInitialize()
+        try:
+            enum = pc.AudioUtilities.GetDeviceEnumerator()
+            col = enum.EnumAudioEndpoints(pc.EDataFlow.eRender.value, pc.DEVICE_STATE.ACTIVE.value)
+            count = col.GetCount()
+            for i in range(count):
+                try:
+                    imm_dev = col.Item(i)
+                    dev = pc.AudioUtilities.CreateDevice(imm_dev)
+                    fname = dev.FriendlyName or ''
+                    if device_name and (device_name.lower() in fname.lower() or fname.lower() in device_name.lower()):
+                        try:
+                            if hasattr(dev, 'EndpointVolume') and dev.EndpointVolume:
+                                dev.EndpointVolume.SetMasterVolumeLevelScalar(volume_scalar, None)
+                                break
+                        except Exception:
+                            pass
+                    del dev
+                    del imm_dev
+                except Exception:
+                    pass
+            del col
+            del enum
         finally:
             CoUninitialize()
     except Exception:
@@ -720,7 +1152,7 @@ class Galaxy3DBackgroundEngine(QtCore.QObject):
         self.theme = "dark"
         self.mode = "galaxy"  # galaxy, planet, tunnel, dust, off (默认开启星河)
         self.blur_enabled = False  # 3D 沉浸背景动效模糊/虚化光晕开关 (默认关：高清针芒星尘)
-        self.num_particles = 1000
+        self.num_particles = 260
 
         # 相机与 3D 旋转参数 (调整相机视角与变焦，星系与星球更加宏伟舒展)
         self.cam_dist = 10.5
@@ -741,8 +1173,42 @@ class Galaxy3DBackgroundEngine(QtCore.QObject):
         self.time_t = 0.0
         self.shockwaves = []
 
+        # 预计算画刷缓存表 (消除 60FPS 渲染循环中频繁构建 QBrush/QColor 的 GC 与 CPU 开销)
+        self._init_brush_lut()
+
         # 预计算粒子几何基础数据
         self._init_particle_geometries()
+
+    def _init_brush_lut(self):
+        """预先构建高频绘制画刷查找表，完全消除渲染循环中的对象分配"""
+        self._brush_lut = {}
+        self._halo_brush_lut = {}
+        for theme in ("dark", "light"):
+            self._brush_lut[theme] = {}
+            self._halo_brush_lut[theme] = {}
+            for c_type in (0, 1, 2):
+                if theme == "light":
+                    if c_type == 0: base_rgb = (217, 119, 6)
+                    elif c_type == 1: base_rgb = (14, 165, 233)
+                    else: base_rgb = (168, 85, 247)
+                    max_a = 220
+                else:
+                    if c_type == 0: base_rgb = (255, 195, 75)
+                    elif c_type == 1: base_rgb = (56, 210, 255)
+                    else: base_rgb = (244, 114, 182)
+                    max_a = 230
+
+                b_list = []
+                h_list = []
+                for a_lvl in range(16):
+                    ratio = a_lvl / 15.0
+                    final_a = int(max(0, min(255, ratio * max_a)))
+                    b_list.append(QBrush(QColor(base_rgb[0], base_rgb[1], base_rgb[2], final_a)))
+                    halo_a = max(4, int(final_a * 0.30))
+                    h_list.append(QBrush(QColor(base_rgb[0], base_rgb[1], base_rgb[2], halo_a)))
+
+                self._brush_lut[theme][c_type] = b_list
+                self._halo_brush_lut[theme][c_type] = h_list
 
     def _init_particle_geometries(self):
         N = self.num_particles
@@ -956,41 +1422,33 @@ class Galaxy3DBackgroundEngine(QtCore.QObject):
         depth_alpha = np.clip(1.0 - z_view[valid] / 24.0, 0.20, 1.0)
         cats = colors_cat[valid]
 
-        # 3. 批量绘制发光粒子 (支持模糊虚化光晕 / 清晰微粒双模式)
+        # 3. 批量绘制发光粒子 (采用预计算画刷缓存表，0 临时对象分配)
         painter.setPen(Qt.PenStyle.NoPen)
+        b_lut = self._brush_lut.get(self.theme, self._brush_lut["dark"])
+        h_lut = self._halo_brush_lut.get(self.theme, self._halo_brush_lut["dark"])
+        blur = self.blur_enabled
+
         for i in range(len(x_2d)):
             px_i = float(x_2d[i])
             py_i = float(y_2d[i])
             sz_i = float(s_2d[i])
-            alp_i = float(depth_alpha[i])
+            a_idx = int(depth_alpha[i] * 15.0)
+            if a_idx > 15:
+                a_idx = 15
+            elif a_idx < 0:
+                a_idx = 0
             c_type = int(cats[i])
+            if c_type not in (0, 1, 2):
+                c_type = 0
 
-            if self.theme == "light":
-                if c_type == 0:
-                    base_rgb = (217, 119, 6)
-                elif c_type == 1:
-                    base_rgb = (14, 165, 233)
-                else:
-                    base_rgb = (168, 85, 247)
-                final_alpha = int(alp_i * 220)
-            else:
-                if c_type == 0:
-                    base_rgb = (255, 195, 75)
-                elif c_type == 1:
-                    base_rgb = (56, 210, 255)
-                else:
-                    base_rgb = (244, 114, 182)
-                final_alpha = int(min(255, alp_i * 255 * 0.90))
-
-            if self.blur_enabled:
+            if blur:
                 # 开启模糊虚化时：叠加柔光外圈 (Bloom Halo)
                 halo_sz = sz_i * 2.2
-                halo_alpha = max(4, int(final_alpha * 0.30))
-                painter.setBrush(QBrush(QColor(base_rgb[0], base_rgb[1], base_rgb[2], halo_alpha)))
+                painter.setBrush(h_lut[c_type][a_idx])
                 painter.drawEllipse(QPointF(px_i, py_i), halo_sz, halo_sz)
 
             # 核心高清针芒星尘 (Crisp Star Core)
-            painter.setBrush(QBrush(QColor(base_rgb[0], base_rgb[1], base_rgb[2], final_alpha)))
+            painter.setBrush(b_lut[c_type][a_idx])
             painter.drawEllipse(QPointF(px_i, py_i), sz_i, sz_i)
 
 
@@ -999,6 +1457,7 @@ class MainCentralWidget(QWidget):
     def __init__(self, bg_engine, parent=None):
         super().__init__(parent)
         self.setObjectName("CentralWidget")
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.bg_engine = bg_engine
 
     def paintEvent(self, event):
@@ -1037,6 +1496,20 @@ class SpectrumVisualizerWidget(QWidget):
 
         # 生成 72 频段赛博高科技连续光谱色板
         self.bar_colors = self._generate_cyber_palette(self.num_bars)
+        self._init_static_brushes()
+
+    def _init_static_brushes(self):
+        """预计算 72 频段高频绘制画刷，杜绝每帧动态分配 QBrush/QColor/QLinearGradient"""
+        self._bar_solid_brushes = [QBrush(c) for c in self.bar_colors]
+        self._ghost_brushes_dark = [QBrush(QColor(c.red(), c.green(), c.blue(), 30)) for c in self.bar_colors]
+        self._ghost_brushes_light = [QBrush(QColor(c.red(), c.green(), c.blue(), 20)) for c in self.bar_colors]
+        self._refl_brushes_dark = [QBrush(QColor(c.red(), c.green(), c.blue(), 50)) for c in self.bar_colors]
+        self._refl_brushes_light = [QBrush(QColor(c.red(), c.green(), c.blue(), 28)) for c in self.bar_colors]
+        self._halo_brushes_dark = [QBrush(QColor(c.red(), c.green(), c.blue(), 65)) for c in self.bar_colors]
+        self._halo_brushes_light = [QBrush(QColor(c.red(), c.green(), c.blue(), 35)) for c in self.bar_colors]
+        self._tip_brush = QBrush(QColor(255, 255, 255, 210))
+        self._bead_core_dark = QBrush(QColor(255, 255, 255, 240))
+        self._bead_core_light = QBrush(QColor(255, 255, 255, 220))
 
     def _generate_cyber_palette(self, num_bars):
         """生成极具前沿科技感的光谱色谱 (Electric Cyan -> Neon Mint -> Solar Gold -> Cyber Coral -> Hyper Violet)"""
@@ -1067,18 +1540,77 @@ class SpectrumVisualizerWidget(QWidget):
 
     def set_theme(self, theme):
         self.theme = theme
+        self._rebuild_bg_pixmap()
         self.update()
 
     def set_translucent(self, translucent):
         self.translucent = translucent
         self.update()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rebuild_bg_pixmap()
+
+    def _rebuild_bg_pixmap(self):
+        """将静态外框底板、刻度线、分贝标签与声学频标预渲染至 QPixmap 缓存，消除每帧数百次矢量绘图指令"""
+        w = max(10, self.width())
+        h = max(10, self.height())
+        is_dark = (self.theme == "dark")
+        self._bg_pixmap = QPixmap(w, h)
+        self._bg_pixmap.fill(Qt.GlobalColor.transparent)
+        p = QPainter(self._bg_pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # 1. 现代化深空暗黑磨砂外框底板
+        bg_col = QColor(10, 11, 16, 215) if is_dark else QColor(248, 250, 252, 230)
+        border_col = QColor(30, 41, 59, 200) if is_dark else QColor(226, 232, 240, 220)
+        p.setBrush(QBrush(bg_col))
+        p.setPen(QPen(border_col, 1))
+        p.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
+
+        padding_x = 18.0
+        padding_top = 8.0
+        baseline_y = h - 15.0
+        max_bar_h = baseline_y - padding_top - 4.0
+
+        # 2. 科技网格分贝刻度参考线
+        db_levels = [(0.75, "-6 dB"), (0.50, "-18 dB"), (0.25, "-36 dB")]
+        grid_pen = QPen(QColor(255, 255, 255, 12 if is_dark else 18), 1, Qt.PenStyle.DashLine)
+        grid_pen.setDashPattern([3, 5])
+        p.setPen(grid_pen)
+        font_db = QFont("Microsoft YaHei")
+        font_db.setPixelSize(9)
+        p.setFont(font_db)
+
+        for ratio, label in db_levels:
+            line_y = baseline_y - max_bar_h * ratio
+            p.drawLine(QPointF(padding_x, line_y), QPointF(w - padding_x, line_y))
+            p.setPen(QColor(255, 255, 255, 45 if is_dark else 70))
+            p.drawText(QRectF(w - padding_x - 42, line_y - 7, 40, 14), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
+            p.setPen(grid_pen)
+
+        # 3. 声学频率基准线 (Baseline)
+        base_pen = QPen(QColor(56, 189, 248, 55 if is_dark else 40), 1)
+        p.setPen(base_pen)
+        p.drawLine(QPointF(padding_x, baseline_y), QPointF(w - padding_x, baseline_y))
+
+        # 4. 底部声学频段刻度标记
+        freq_landmarks = [(0.05, "SUB"), (0.20, "BASS"), (0.42, "MID"), (0.70, "HIGH"), (0.92, "AIR")]
+        font_tag = QFont("Microsoft YaHei", 8, QFont.Weight.Bold)
+        font_tag.setPixelSize(9)
+        p.setFont(font_tag)
+        usable_w = w - 2 * padding_x
+        for norm_x, tag_txt in freq_landmarks:
+            tx = padding_x + usable_w * norm_x
+            p.setPen(QColor(148, 163, 184, 110 if is_dark else 140))
+            p.drawText(QRectF(tx - 25, baseline_y + 1, 50, 13), Qt.AlignmentFlag.AlignCenter, tag_txt)
+        p.end()
+
     def update_magnitudes(self, fft_magnitudes):
         if fft_magnitudes is not None and len(fft_magnitudes) > 0:
             if len(fft_magnitudes) == self.num_bars:
                 self.raw_magnitudes = fft_magnitudes
             else:
-                # 动态自适应重采样到目标频段数
                 old_x = np.linspace(0, 1, len(fft_magnitudes))
                 new_x = np.linspace(0, 1, self.num_bars)
                 self.raw_magnitudes = np.interp(new_x, old_x, fft_magnitudes).astype(np.float32)
@@ -1088,73 +1620,25 @@ class SpectrumVisualizerWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
+        # 1. 直接绘制预缓存的静态底板与分贝刻度 (1 次 C++ 调用，0 重绘开销)
+        if not hasattr(self, '_bg_pixmap') or self._bg_pixmap.isNull():
+            self._rebuild_bg_pixmap()
+        painter.drawPixmap(0, 0, self._bg_pixmap)
+
         w = self.width()
         h = self.height()
         is_dark = (self.theme == "dark")
 
-        # 1. 现代化深空暗黑磨砂外框底板
-        bg_col = QColor(10, 11, 16, 215) if is_dark else QColor(248, 250, 252, 230)
-        border_col = QColor(30, 41, 59, 200) if is_dark else QColor(226, 232, 240, 220)
-        painter.setBrush(QBrush(bg_col))
-        painter.setPen(QPen(border_col, 1))
-        painter.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
-
-        # 布局坐标计算
         padding_x = 18.0
         padding_top = 8.0
-        baseline_y = h - 15.0  # 基线位置，下方预留 15px 给频标与倒影
+        baseline_y = h - 15.0
         max_bar_h = baseline_y - padding_top - 4.0
-
-        # 2. 科技网格分贝刻度参考线 (Reference dB Grid Lines)
-        db_levels = [
-            (0.75, "-6 dB"),
-            (0.50, "-18 dB"),
-            (0.25, "-36 dB")
-        ]
-        grid_pen = QPen(QColor(255, 255, 255, 12 if is_dark else 18), 1, Qt.PenStyle.DashLine)
-        grid_pen.setDashPattern([3, 5])
-        painter.setPen(grid_pen)
-        font_db = QFont("Microsoft YaHei")
-        font_db.setPixelSize(9)
-        painter.setFont(font_db)
-
-        for ratio, label in db_levels:
-            line_y = baseline_y - max_bar_h * ratio
-            painter.drawLine(QPointF(padding_x, line_y), QPointF(w - padding_x, line_y))
-            # 右侧标注微型文字
-            painter.setPen(QColor(255, 255, 255, 45 if is_dark else 70))
-            painter.drawText(QRectF(w - padding_x - 42, line_y - 7, 40, 14), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
-            painter.setPen(grid_pen)
-
-        # 3. 声学频率基准线 (Baseline)
-        base_pen = QPen(QColor(56, 189, 248, 55 if is_dark else 40), 1)
-        painter.setPen(base_pen)
-        painter.drawLine(QPointF(padding_x, baseline_y), QPointF(w - padding_x, baseline_y))
-
-        # 4. 底部声学频段刻度标记 (SUB / BASS / MID / HIGH / AIR)
-        freq_landmarks = [
-            (0.05, "SUB"),
-            (0.20, "BASS"),
-            (0.42, "MID"),
-            (0.70, "HIGH"),
-            (0.92, "AIR"),
-        ]
-        font_tag = QFont("Microsoft YaHei", 8, QFont.Weight.Bold)
-        font_tag.setPixelSize(9)
-        painter.setFont(font_tag)
         usable_w = w - 2 * padding_x
-        for norm_x, tag_txt in freq_landmarks:
-            tx = padding_x + usable_w * norm_x
-            painter.setPen(QColor(148, 163, 184, 110 if is_dark else 140))
-            painter.drawText(QRectF(tx - 25, baseline_y + 1, 50, 13), Qt.AlignmentFlag.AlignCenter, tag_txt)
 
-        # 5. 柱状与间距几何计算
         total_gaps = (self.num_bars - 1)
         gap = max(1.8, min(3.2, usable_w / float(self.num_bars * 3.5)))
         bar_w = (usable_w - total_gaps * gap) / float(self.num_bars)
         bar_w = max(2.5, bar_w)
-
-        # 居中偏移修正
         actual_total_w = self.num_bars * bar_w + total_gaps * gap
         start_x = padding_x + max(0.0, (usable_w - actual_total_w) / 2.0)
 
@@ -1167,97 +1651,84 @@ class SpectrumVisualizerWidget(QWidget):
             is_idle = True
             self.idle_phase += 0.035
 
-        # 6. 渲染 72 根精细高科技律动柱
+        ghost_brushes = self._ghost_brushes_dark if is_dark else self._ghost_brushes_light
+        refl_brushes = self._refl_brushes_dark if is_dark else self._refl_brushes_light
+        halo_brushes = self._halo_brushes_dark if is_dark else self._halo_brushes_light
+        bead_core = self._bead_core_dark if is_dark else self._bead_core_light
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        bar_r = min(1.8, bar_w / 2.0)
+
+        # 2. 渲染 72 根精细高科技律动柱
         for i in range(self.num_bars):
             val = float(self.raw_magnitudes[i]) if not is_idle else 0.0
             if is_idle:
-                # 待机待命呼吸波 (Standby Ambient Cyber Wave)
                 norm_val = 0.04 + 0.03 * math.sin(self.idle_phase + i * 0.14)
             else:
-                # 高频人耳听觉感知增益补偿 (Fletcher-Munson Perceptual Curve)
                 comp = 0.75 + 1.25 * math.pow(i / float(self.num_bars - 1), 0.48)
                 val_comp = val * comp
                 norm_val = min(1.0, math.pow(val_comp / max(0.01, self.global_peak), 0.7))
 
-            # 瞬态响应：极速 Attack，丝滑指数衰减 Release
             if norm_val > self.smooth_bars[i]:
                 self.smooth_bars[i] = self.smooth_bars[i] * 0.45 + norm_val * 0.55
             else:
                 self.smooth_bars[i] = self.smooth_bars[i] * 0.82 + norm_val * 0.18
 
             bar_h = min(max_bar_h, self.smooth_bars[i] * max_bar_h)
-
-            # 荧光余晖残影衰减物理模拟 (Phosphor Ghost Trail)
-            if bar_h > self.ghost_bars[i]:
-                self.ghost_bars[i] = bar_h
-            else:
-                self.ghost_bars[i] = max(0.0, self.ghost_bars[i] * 0.92)
-
-            # 悬浮重力落差光标物理模拟 (Gravity Peak Hold)
-            if bar_h > self.peak_heights[i]:
-                self.peak_heights[i] = bar_h
-                self.peak_velocities[i] = 0.0
-                self.peak_holds[i] = 12  # 悬停约 180ms
-            else:
-                if self.peak_holds[i] > 0:
-                    self.peak_holds[i] -= 1
-                else:
-                    self.peak_velocities[i] += 0.16  # 重力加速度
-                    self.peak_heights[i] = max(0.0, self.peak_heights[i] - self.peak_velocities[i])
-
             x = start_x + i * (bar_w + gap)
             y = baseline_y - bar_h
-            base_col = self.bar_colors[i]
 
-            # A. 荧光余晖残影 (Ghost Trail)
-            if self.ghost_bars[i] > bar_h + 2.0:
-                ghost_y = baseline_y - self.ghost_bars[i]
-                ghost_col = QColor(base_col.red(), base_col.green(), base_col.blue(), 30 if is_dark else 20)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(ghost_col))
-                painter.drawRoundedRect(QRectF(x, ghost_y, bar_w, self.ghost_bars[i] - bar_h), 1.2, 1.2)
+            if is_idle:
+                # 待机状态：仅绘制轻量精致的主律动光柱，彻底省略残影/倒影/高能亮珠以节省 CPU
+                if bar_h > 0.5:
+                    painter.setBrush(self._bar_solid_brushes[i])
+                    painter.drawRoundedRect(QRectF(x, y, bar_w, bar_h), bar_r, bar_r)
+            else:
+                # 动态发声状态：完整物理模拟与发光层
+                if bar_h > self.ghost_bars[i]:
+                    self.ghost_bars[i] = bar_h
+                else:
+                    self.ghost_bars[i] = max(0.0, self.ghost_bars[i] * 0.92)
 
-            # B. 底部全息镜面微倒影 (Hologram Mirror Reflection)
-            if bar_h > 2.0:
-                refl_h = min(9.0, bar_h * 0.24)
-                refl_grad = QLinearGradient(x, baseline_y, x, baseline_y + refl_h)
-                refl_grad.setColorAt(0.0, QColor(base_col.red(), base_col.green(), base_col.blue(), 50 if is_dark else 28))
-                refl_grad.setColorAt(1.0, QColor(base_col.red(), base_col.green(), base_col.blue(), 0))
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(refl_grad))
-                painter.drawRoundedRect(QRectF(x, baseline_y + 1.0, bar_w, refl_h), 1.0, 1.0)
+                if bar_h > self.peak_heights[i]:
+                    self.peak_heights[i] = bar_h
+                    self.peak_velocities[i] = 0.0
+                    self.peak_holds[i] = 12
+                else:
+                    if self.peak_holds[i] > 0:
+                        self.peak_holds[i] -= 1
+                    else:
+                        self.peak_velocities[i] += 0.16
+                        self.peak_heights[i] = max(0.0, self.peak_heights[i] - self.peak_velocities[i])
 
-            # C. 律动光柱实体 (Sleek Cyber Neon Pillar)
-            if bar_h > 1.0:
-                bar_grad = QLinearGradient(x, baseline_y, x, y)
-                bar_grad.setColorAt(0.0, QColor(base_col.red(), base_col.green(), base_col.blue(), 75 if is_dark else 110))
-                bar_grad.setColorAt(0.65, QColor(base_col.red(), base_col.green(), base_col.blue(), 215 if is_dark else 230))
-                bar_grad.setColorAt(1.0, QColor(min(255, base_col.red() + 60), min(255, base_col.green() + 60), min(255, base_col.blue() + 60), 255))
-                
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(bar_grad))
-                bar_r = min(1.8, bar_w / 2.0)
-                painter.drawRoundedRect(QRectF(x, y, bar_w, bar_h), bar_r, bar_r)
+                # A. 荧光余晖残影
+                if self.ghost_bars[i] > bar_h + 2.0:
+                    ghost_y = baseline_y - self.ghost_bars[i]
+                    painter.setBrush(ghost_brushes[i])
+                    painter.drawRoundedRect(QRectF(x, ghost_y, bar_w, self.ghost_bars[i] - bar_h), 1.2, 1.2)
 
-                # 柱顶高能发光焦点 (Luminous Hot Tip)
-                tip_h = min(2.5, bar_h)
-                tip_col = QColor(255, 255, 255, 210)
-                painter.setBrush(QBrush(tip_col))
-                painter.drawRoundedRect(QRectF(x, y, bar_w, tip_h), bar_r, bar_r)
+                # B. 底部全息镜面微倒影
+                if bar_h > 2.0:
+                    refl_h = min(9.0, bar_h * 0.24)
+                    painter.setBrush(refl_brushes[i])
+                    painter.drawRoundedRect(QRectF(x, baseline_y + 1.0, bar_w, refl_h), 1.0, 1.0)
 
-            # D. 悬浮重力落差光标 (Floating Luminous Peak Bead)
-            if self.peak_heights[i] > 2.0:
-                peak_y = baseline_y - self.peak_heights[i] - 2.5
-                # 光晕
-                halo_col = QColor(base_col.red(), base_col.green(), base_col.blue(), 65 if is_dark else 35)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(halo_col))
-                painter.drawRoundedRect(QRectF(x - 0.5, peak_y - 0.5, bar_w + 1.0, 3.0), 1.2, 1.2)
+                # C. 律动光柱实体 + 柱顶高能发光焦点
+                if bar_h > 1.0:
+                    painter.setBrush(self._bar_solid_brushes[i])
+                    painter.drawRoundedRect(QRectF(x, y, bar_w, bar_h), bar_r, bar_r)
 
-                # 核心亮珠 (Pure White-Hot Core Bead)
-                core_col = QColor(255, 255, 255, 240 if is_dark else 220)
-                painter.setBrush(QBrush(core_col))
-                painter.drawRoundedRect(QRectF(x, peak_y, bar_w, 2.0), 1.0, 1.0)
+                    tip_h = min(2.5, bar_h)
+                    painter.setBrush(self._tip_brush)
+                    painter.drawRoundedRect(QRectF(x, y, bar_w, tip_h), bar_r, bar_r)
+
+                # D. 悬浮重力落差光标
+                if self.peak_heights[i] > 2.0:
+                    peak_y = baseline_y - self.peak_heights[i] - 2.5
+                    painter.setBrush(halo_brushes[i])
+                    painter.drawRoundedRect(QRectF(x - 0.5, peak_y - 0.5, bar_w + 1.0, 3.0), 1.2, 1.2)
+                    painter.setBrush(bead_core)
+                    painter.drawRoundedRect(QRectF(x, peak_y, bar_w, 2.0), 1.0, 1.0)
 
 
 class EffectCardWidget(QFrame):
@@ -1454,6 +1925,7 @@ class SodaMusicPlayerQtApp(QMainWindow):
     sig_show_error = Signal(str, str)
     sig_show_info = Signal(str, str)
     sig_audio_devices_changed = Signal()
+    sig_sys_volume_changed = Signal(float)
 
     def __init__(self):
         super().__init__()
@@ -1470,6 +1942,8 @@ class SodaMusicPlayerQtApp(QMainWindow):
         self.current_theme = self.user_cfg.get("theme", "dark")
         self.bg_blur = self.user_cfg.get("bg_blur", True)
         self.saved_vol = int(self.user_cfg.get("volume", 100))
+        if self.saved_vol < 10:
+            self.saved_vol = 100
         self.volume = self.saved_vol / 100.0
         self.prev_volume = self.volume if self.volume > 0 else 1.0
         self.is_muted = False
@@ -1477,11 +1951,20 @@ class SodaMusicPlayerQtApp(QMainWindow):
         self.effect_intensities = self.user_cfg.get("intensities", {})
 
         self.pa = pyaudio.PyAudio()
+        self.audio_lock = threading.RLock()
         self.dsp_process = None
         self.dsp_client = DspClient()
         self.sample_rate = 48000
+        self.live_rate = 48000
+        self.live_in_sr = 48000
+        self.live_chunk_size = 1024
+        self.cable_out_channels = 2
+        self.phys_out_channels = 2
 
         self.is_live_capturing = False
+        self.is_live_starting = False
+        self.is_live_stopping = False
+        self._is_recovering = False
         self.live_thread = None
         self.in_thread = None
         self.live_in_stream = None
@@ -1491,34 +1974,51 @@ class SodaMusicPlayerQtApp(QMainWindow):
         self.has_cable_installed = False
         self.output_dev_list = []
         self.fft_magnitudes = np.zeros(72, dtype=np.float32)
-        self.sys_vol_watcher = SystemVolumeWatcher()
+        self.sys_vol_watcher = SystemVolumeWatcher(self._on_sys_volume_changed)
 
         self._last_device_signature = get_active_render_device_signature()
 
-        # 音频设备变更防抖定时器 (350ms 聚合多次蓝牙/系统事件)
+        # 音频设备变更防抖定时器 (150ms 聚合多次蓝牙/系统事件)
         self.device_debounce_timer = QTimer(self)
         self.device_debounce_timer.setSingleShot(True)
         self.device_debounce_timer.timeout.connect(lambda: self.populate_audio_devices(trigger_source='auto'))
 
-        # 轻量心跳轮询定时器 (1.5秒检测一次活动设备签名，兜底极端驱动情况)
+        # 轻量心跳轮询定时器 (1秒检测一次活动设备签名，敏捷兜底蓝牙断开)
         self.device_poll_timer = QTimer(self)
         self.device_poll_timer.timeout.connect(self._check_device_signature_poll)
-        self.device_poll_timer.start(1500)
+        self.device_poll_timer.start(1000)
 
         # Core Audio IMMNotificationClient 后台监听器
         self.device_watcher = WindowsAudioDeviceWatcher(self._on_device_watcher_event)
         self.device_watcher.start()
 
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.init_signals()
         self.init_ui()
         self.apply_theme(self.current_theme)
-        self.start_dsp_backend()
-        self.populate_audio_devices(trigger_source='manual')
 
-        # 启动 60FPS 硬件加速频谱律动定时器
+        # 立即应用 Windows DWM 沉浸式暗色标题栏，杜绝启动白条
+        apply_dwm_dark_mode(self.winId(), dark=(self.current_theme != 'light'))
+
+        self.is_really_quitting = False
+        self.tray_tip_shown = False
+        self.init_tray_icon()
+
+        # 启动 30~60FPS 平滑动态频谱律动与天体动力学定时器 (极致节能与丝滑体验平衡点)
         self.visualizer_timer = QTimer(self)
         self.visualizer_timer.timeout.connect(self._on_visualizer_tick)
-        self.visualizer_timer.start(16)
+        self.visualizer_timer.start(33)
+
+        # 异步非阻塞拉起后台 DSP 与设备枚举，让主界面瞬间完成首帧渲染（0 毫秒白屏/停滞）
+        QTimer.singleShot(0, self._async_init_services)
+
+    def _async_init_services(self):
+        """主界面渲染完成后立即异步拉起 DSP 后台与声卡探测"""
+        if not self.is_live_capturing:
+            # 待机未开启状态下，确保 Windows 任务栏声音列表干净（隐藏虚拟声卡）
+            WindowsAudioPolicyHelper.set_virtual_cable_visibility(visible=False)
+        self.start_dsp_backend()
+        self.populate_audio_devices(trigger_source='manual')
 
     def load_user_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -1545,22 +2045,42 @@ class SodaMusicPlayerQtApp(QMainWindow):
         self.sig_show_error.connect(lambda title, msg: QMessageBox.critical(self, title, msg))
         self.sig_show_info.connect(lambda title, msg: QMessageBox.information(self, title, msg))
         self.sig_audio_devices_changed.connect(self._on_audio_devices_changed_signal)
+        self.sig_sys_volume_changed.connect(self._on_sys_volume_display_update)
+
+    def _on_sys_volume_display_update(self, sys_vol):
+        """当系统音量改变时刷新音量悬浮提示与叠加总音量展示"""
+        try:
+            soft_pct = self.vol_slider.value() if hasattr(self, 'vol_slider') else int(self.volume * 100)
+            sys_pct = int(round(float(sys_vol) * 100))
+            total_pct = int(round((soft_pct * sys_pct) / 100.0))
+            tip = f"软件音量: {soft_pct}%  |  系统音量: {sys_pct}%\n★ 实时叠加总音量: {total_pct}%"
+            if hasattr(self, 'vol_badge'):
+                self.vol_badge.setToolTip(tip)
+            if hasattr(self, 'vol_slider'):
+                self.vol_slider.setToolTip(tip)
+        except Exception:
+            pass
 
     def _on_audio_devices_changed_signal(self):
-        """收到设备变更信号时启动 350ms 防抖更新"""
+        """收到设备变更信号时启动 150ms 防抖更新"""
         if hasattr(self, 'device_debounce_timer'):
-            self.device_debounce_timer.start(350)
+            self.device_debounce_timer.start(150)
 
     def _on_device_watcher_event(self, event_type, *args):
         """由 Windows Core Audio 回调线程触发"""
         self.sig_audio_devices_changed.emit()
 
     def _check_device_signature_poll(self):
-        """轻量心跳巡检活动设备列表"""
-        sig = get_active_render_device_signature()
-        if sig and sig != self._last_device_signature:
-            self._last_device_signature = sig
-            self.sig_audio_devices_changed.emit()
+        """轻量心跳巡检活动设备列表 (在独立后台线程中执行，杜绝干扰 Qt 主线程 COM 公寓)"""
+        def _poll():
+            try:
+                sig = get_active_render_device_signature()
+                if sig and sig != self._last_device_signature:
+                    self._last_device_signature = sig
+                    self.sig_audio_devices_changed.emit()
+            except Exception:
+                pass
+        threading.Thread(target=_poll, daemon=True).start()
 
     def nativeEvent(self, eventType, message):
         """拦截 Windows 原生 WM_DEVICECHANGE 硬件即插即用广播消息"""
@@ -1621,10 +2141,10 @@ class SodaMusicPlayerQtApp(QMainWindow):
         if is_light:
             self.setStyleSheet(f"""
                 QMainWindow {{
-                    background-color: transparent;
+                    background-color: #f3f4f6;
                 }}
                 QWidget#CentralWidget {{
-                    background-color: transparent;
+                    background-color: #f3f4f6;
                 }}
                 QWidget#ContentWidget {{
                     background-color: transparent;
@@ -1704,10 +2224,10 @@ class SodaMusicPlayerQtApp(QMainWindow):
         else:
             self.setStyleSheet(f"""
                 QMainWindow {{
-                    background-color: transparent;
+                    background-color: #121216;
                 }}
                 QWidget#CentralWidget {{
-                    background-color: transparent;
+                    background-color: #121216;
                 }}
                 QWidget#ContentWidget {{
                     background-color: transparent;
@@ -2023,16 +2543,27 @@ class SodaMusicPlayerQtApp(QMainWindow):
         content_vbox.addWidget(effect_card)
 
     def _on_visualizer_tick(self):
-        """60FPS 极速渲染刷新"""
-        if not self.isMinimized():
-            self.visualizer_widget.update_magnitudes(self.fft_magnitudes)
-            if hasattr(self, 'bg_3d_engine'):
-                raw_fft = getattr(self, 'fft_raw_spectrum', None)
-                raw_rms = getattr(self, 'audio_rms_val', 0.0)
-                sr = getattr(self, 'live_in_sr', 48000)
-                self.bg_3d_engine.process_audio_frame(raw_fft, raw_rms, sample_rate=sr, dt=0.016)
-            if self.centralWidget():
-                self.centralWidget().update()
+        """自适应动态刷新渲染 (窗口隐藏/最小化彻底挂起，后台无声时深度节能，前台平滑丝滑)"""
+        if not self.isVisible() or self.isMinimized():
+            return
+
+        is_active = self.isActiveWindow()
+        has_audio = getattr(self, 'is_live_capturing', False) and getattr(self, 'fft_raw_spectrum', None) is not None
+
+        # 智能自适应帧率调节：前台或播放时 30FPS (33ms)，后台且待机时 12FPS (80ms)
+        target_interval = 33 if (is_active or has_audio) else 80
+        if self.visualizer_timer.interval() != target_interval:
+            self.visualizer_timer.setInterval(target_interval)
+
+        self.visualizer_widget.update_magnitudes(self.fft_magnitudes)
+        if hasattr(self, 'bg_3d_engine'):
+            raw_fft = getattr(self, 'fft_raw_spectrum', None)
+            raw_rms = getattr(self, 'audio_rms_val', 0.0)
+            sr = getattr(self, 'live_in_sr', 48000)
+            dt = target_interval / 1000.0
+            self.bg_3d_engine.process_audio_frame(raw_fft, raw_rms, sample_rate=sr, dt=dt)
+        if self.centralWidget():
+            self.centralWidget().update()
 
     def on_bg_mode_changed(self, index):
         mode = self.combo_bg_mode.itemData(index)
@@ -2047,8 +2578,29 @@ class SodaMusicPlayerQtApp(QMainWindow):
     def log(self, msg):
         logging.info(msg)
 
+    def play_feedback_sound(self, is_on=True):
+        """异步播放开启/关闭全局增强的柔和物理提示音 (零延迟、零杂音)"""
+        def _play():
+            try:
+                wav_name = "sound_on.wav" if is_on else "sound_off.wav"
+                wav_path = os.path.join(BASE_DIR, "assets", wav_name)
+                if not os.path.exists(wav_path):
+                    ensure_feedback_sound_files()
+                if os.path.exists(wav_path) and sys.platform == 'win32':
+                    import winsound
+                    winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            except Exception as e:
+                logging.debug(f"Play feedback sound error: {e}")
+        threading.Thread(target=_play, daemon=True).start()
+
     def start_dsp_backend(self):
         try:
+            # 1. 优先探测是否已有现成的 DSP 服务正在监听
+            if self.dsp_client.connect(retries=2, delay=0.1):
+                logging.info("DSP Backend already running and connected successfully!")
+                self.apply_current_effect_to_dsp()
+                return
+
             startupinfo = None
             if sys.platform == 'win32':
                 startupinfo = subprocess.STARTUPINFO()
@@ -2118,6 +2670,45 @@ class SodaMusicPlayerQtApp(QMainWindow):
                 logging.error(f"Failed to set default sound device via nircmd: {e}")
         return False
 
+    def _on_sys_volume_changed(self, vol_scalar):
+        """当 Windows 系统主音量改变时自动记忆数值并触发 UI 联动 (0% ~ 100%)"""
+        try:
+            if 0.0 <= vol_scalar <= 1.0:
+                self.user_cfg["system_volume"] = int(round(vol_scalar * 100))
+                self.save_user_config()
+                self.sig_sys_volume_changed.emit(vol_scalar)
+        except Exception:
+            pass
+
+    def get_target_system_volume(self, fallback_device_name=None):
+        """
+        获取开启或关闭时系统声音的目标音量标量 (0.0 ~ 1.0)
+        """
+        try:
+            # 1. 优先从当前系统音量监听器获取实时有效音量 (忽略低于 5% 的异常过低残留值)
+            if hasattr(self, 'sys_vol_watcher') and self.sys_vol_watcher:
+                v = getattr(self.sys_vol_watcher, 'sys_vol', None)
+                if v is not None and 0.05 <= v <= 1.0:
+                    return float(v)
+
+            # 2. 尝试从用户持久化配置中获取记录的系统音量
+            recorded_pct = self.user_cfg.get("system_volume")
+            if recorded_pct is not None and isinstance(recorded_pct, (int, float)):
+                scalar = float(recorded_pct) / 100.0
+                if 0.05 <= scalar <= 1.0:
+                    return scalar
+
+            # 3. 尝试从物理设备端点获取当前音量
+            if fallback_device_name:
+                cur = get_device_endpoint_volume(fallback_device_name)
+                if cur is not None and 0.05 <= cur <= 1.0:
+                    return cur
+        except Exception:
+            pass
+
+        # 4. 默认安全适中值：50% (0.50)
+        return 0.50
+
     def populate_audio_devices(self, trigger_source='auto'):
         try:
             prev_sel_name = None
@@ -2129,16 +2720,25 @@ class SodaMusicPlayerQtApp(QMainWindow):
 
             old_device_names = set(item[4] for item in self.output_dev_list)
 
-            # 在开启增强时使用独立探测实例，避免 terminate 影响正在进行的实时音频流
-            probe_pa = None
-            if not self.is_live_capturing:
-                try: self.pa.terminate()
-                except Exception: pass
-                self.pa = pyaudio.PyAudio()
+            # 状态保护：若未运行音频流则直接重建 self.pa；若正在运行音频流则使用独立枚举实例探测，避免影响主流
+            is_busy = self.is_live_capturing or getattr(self, 'is_live_starting', False) or getattr(self, 'is_live_stopping', False)
+            should_terminate_enum = False
+            if not is_busy:
+                with self.audio_lock:
+                    try: self.pa.terminate()
+                    except Exception: pass
+                    self.pa = pyaudio.PyAudio()
                 active_pa = self.pa
             else:
-                probe_pa = pyaudio.PyAudio()
-                active_pa = probe_pa
+                try:
+                    active_pa = pyaudio.PyAudio()
+                    should_terminate_enum = True
+                except Exception:
+                    active_pa = self.pa
+
+            # 获取 Windows 实时活动输出设备名称白名单（避免 PortAudio 内部 C 缓存残留已断开的蓝牙/USB设备）
+            active_render_names = get_active_render_device_names()
+            active_render_lower = [n.lower() for n in active_render_names]
 
             new_dev_list = []
             has_cable = False
@@ -2157,6 +2757,10 @@ class SodaMusicPlayerQtApp(QMainWindow):
                     if "wasapi" in host_info["name"].lower():
                         if dev["maxOutputChannels"] > 0 and not dev.get("isLoopbackDevice", False):
                             if 'cable' not in name_lower and 'vb-audio' not in name_lower:
+                                # 严格校验：若 Core Audio 能读取到活动设备，则必须在该白名单中
+                                if active_render_lower and not any(r in name_lower or name_lower in r for r in active_render_lower):
+                                    continue
+
                                 is_headphone = any(k in name_lower for k in [
                                     '耳机', 'headphone', 'headset', 'earphone', 'buds', 'airpods',
                                     'wh-1000', 'freebuds', 'bose', 'sony', 'xiaomi', 'beats', 'oppo', 'vivo'
@@ -2174,9 +2778,12 @@ class SodaMusicPlayerQtApp(QMainWindow):
                 except Exception as dev_err:
                     logging.warning(f"Error parsing device {i}: {dev_err}")
 
-            if probe_pa:
-                try: probe_pa.terminate()
+            if should_terminate_enum:
+                try: active_pa.terminate()
                 except Exception: pass
+
+            if not has_cable:
+                has_cable = WindowsAudioPolicyHelper.is_cable_installed()
 
             self.has_cable_installed = has_cable
             if self.has_cable_installed:
@@ -2268,7 +2875,7 @@ class SodaMusicPlayerQtApp(QMainWindow):
             self._check_live_stream_hot_swap()
 
     def _check_live_stream_hot_swap(self):
-        if not self.is_live_capturing:
+        if not self.is_live_capturing or getattr(self, 'is_live_starting', False) or getattr(self, 'is_live_stopping', False):
             return
         cur_idx = self.output_dev_combo.currentIndex()
         if cur_idx < 0 or cur_idx >= len(self.output_dev_list):
@@ -2284,100 +2891,209 @@ class SodaMusicPlayerQtApp(QMainWindow):
 
     def _hot_swap_output_device(self, new_phys_idx, new_phys_name, new_phys_sr, new_phys_channels):
         """在保持输入采集与 DSP 运算不中断的前提下，安全热插拔/热切换底层物理输出声卡流"""
+        with self.audio_lock:
+            try:
+                self.log(f"🔄 正在无缝热切换音频输出设备 -> 【{new_phys_name}】...")
+                old_phys_name = getattr(self, 'current_live_phys_name', None)
+
+                # 1. 还原旧设备物理端点音量为当前系统音量
+                if old_phys_name:
+                    last_sys_vol = self.get_target_system_volume(old_phys_name)
+                    try:
+                        set_device_endpoint_volume(old_phys_name, last_sys_vol)
+                    except Exception:
+                        pass
+
+                # 2. 准备新设备物理端点音量：记录新设备当前音量，并将新物理设备设为 1.0 (满音量直通，防止二次衰减)
+                cur_phys_vol = get_device_endpoint_volume(new_phys_name)
+                if cur_phys_vol is not None and cur_phys_vol > 0.0:
+                    self.original_phys_vol = cur_phys_vol
+                else:
+                    self.original_phys_vol = self.get_target_system_volume(new_phys_name)
+
+                set_device_endpoint_volume(new_phys_name, 1.0)
+                self.current_live_phys_name = new_phys_name
+                self.original_default_audio_name = new_phys_name
+
+                # 3. 安全停止并关闭旧物理输出流与输入流，重置 PyAudio 实例以刷新 PortAudio WASAPI 句柄
+                old_out_stream = self.live_out_stream
+                self.live_out_stream = None
+                if old_out_stream:
+                    try:
+                        old_out_stream.stop_stream()
+                        old_out_stream.close()
+                    except Exception: pass
+
+                old_in_stream = self.live_in_stream
+                self.live_in_stream = None
+                if old_in_stream:
+                    try:
+                        old_in_stream.stop_stream()
+                        old_in_stream.close()
+                    except Exception: pass
+
+                try:
+                    self.pa.terminate()
+                except Exception: pass
+                self.pa = pyaudio.PyAudio()
+
+                # 4. 在全新 PyAudio 实例中精确定位 CABLE 与新输出设备
+                cable_out_idx = None
+                cable_out_sr = 48000
+                cable_out_channels = 2
+                for i in range(self.pa.get_device_count()):
+                    try:
+                        dev = self.pa.get_device_info_by_index(i)
+                        host_info = self.pa.get_host_api_info_by_index(dev["hostApi"])
+                        name = dev["name"].lower()
+                        if "wasapi" in host_info["name"].lower() and ('cable' in name or 'vb-audio' in name) and dev["maxInputChannels"] > 0:
+                            cable_out_idx = i
+                            cable_out_sr = int(dev["defaultSampleRate"])
+                            cable_out_channels = min(2, dev["maxInputChannels"])
+                            break
+                    except Exception: pass
+
+                fresh_phys_idx = None
+                fresh_phys_sr = new_phys_sr
+                fresh_phys_channels = new_phys_channels
+                for i in range(self.pa.get_device_count()):
+                    try:
+                        d_info = self.pa.get_device_info_by_index(i)
+                        h_info = self.pa.get_host_api_info_by_index(d_info["hostApi"])
+                        if "wasapi" in h_info["name"].lower() and d_info["maxOutputChannels"] > 0 and not d_info.get("isLoopbackDevice", False):
+                            if d_info["name"] == new_phys_name or new_phys_name in d_info["name"]:
+                                fresh_phys_idx = i
+                                fresh_phys_sr = int(d_info["defaultSampleRate"])
+                                fresh_phys_channels = min(2, d_info["maxOutputChannels"])
+                                break
+                    except Exception: pass
+
+                if fresh_phys_idx is None:
+                    fresh_phys_idx = new_phys_idx
+
+                self.live_rate = fresh_phys_sr
+                self.sample_rate = fresh_phys_sr
+                self.phys_out_channels = max(1, min(2, fresh_phys_channels or 2))
+                self.cable_out_channels = max(1, min(2, cable_out_channels or 2))
+
+                # 5. 重新打开 CABLE 输入流与新物理输出流
+                if cable_out_idx is not None:
+                    try:
+                        self.live_in_stream = self.pa.open(
+                            format=pyaudio.paFloat32,
+                            channels=cable_out_channels,
+                            rate=self.live_rate,
+                            input=True,
+                            input_device_index=cable_out_idx,
+                            frames_per_buffer=self.live_chunk_size
+                        )
+                        self.live_in_sr = self.live_rate
+                    except Exception:
+                        self.live_in_stream = self.pa.open(
+                            format=pyaudio.paFloat32,
+                            channels=cable_out_channels,
+                            rate=cable_out_sr,
+                            input=True,
+                            input_device_index=cable_out_idx,
+                            frames_per_buffer=int(self.live_chunk_size * (cable_out_sr / self.live_rate))
+                        )
+                        self.live_in_sr = cable_out_sr
+
+                self.live_out_stream = self.pa.open(
+                    format=pyaudio.paFloat32,
+                    channels=self.phys_out_channels,
+                    rate=self.live_rate,
+                    output=True,
+                    output_device_index=fresh_phys_idx,
+                    frames_per_buffer=self.live_chunk_size
+                )
+                self.sys_vol_watcher.set_phys_device(new_phys_name)
+                self.sys_vol_watcher.reconnect()
+                self.log(f"✅ 音频输出设备已成功切换为: 【{new_phys_name}】")
+            except Exception as e:
+                logging.error(f"Failed to hot-swap output device: {e}")
+
+    def _recover_live_streams(self):
+        """当底层音频流因设备状态变化、休眠唤醒或驱动断开时，安全触发设备重连与自愈"""
+        if not self.is_live_capturing or getattr(self, 'is_live_starting', False) or getattr(self, 'is_live_stopping', False):
+            return
+        logging.info("⏳ 检测到底层音频流异常，正在尝试自动恢复自愈...")
+        self.sig_audio_devices_changed.emit()
+
+    def stop_live_capture_sync(self):
+        """同步平稳停止系统音频流并还原默认设备与音量 (用于 closeEvent 和安全退出)"""
         try:
-            self.log(f"🔄 正在无缝热切换音频输出设备 -> 【{new_phys_name}】...")
-            old_phys_name = getattr(self, 'current_live_phys_name', None)
+            self.is_live_capturing = False
+            self.is_live_starting = False
+            self.is_live_stopping = True
 
-            # 1. 还原旧设备物理端点音量
-            if old_phys_name and hasattr(self, 'original_phys_vol') and self.original_phys_vol is not None:
+            if self.in_thread and self.in_thread.is_alive():
+                try: self.in_thread.join(timeout=0.3)
+                except: pass
+                self.in_thread = None
+
+            if self.live_thread and self.live_thread.is_alive():
+                try: self.live_thread.join(timeout=0.3)
+                except: pass
+                self.live_thread = None
+
+            with self.audio_lock:
+                if self.live_in_stream:
+                    try:
+                        self.live_in_stream.stop_stream()
+                        self.live_in_stream.close()
+                    except: pass
+                    self.live_in_stream = None
+
+                if self.live_out_stream:
+                    try:
+                        self.live_out_stream.stop_stream()
+                        self.live_out_stream.close()
+                    except: pass
+                    self.live_out_stream = None
+
+            try:
+                self.sys_vol_watcher.stop()
+            except Exception: pass
+
+            # 还原 Windows 默认播放设备 (关键！必须同步执行完)
+            if self.original_default_audio_name:
+                self.set_windows_default_playback_device(self.original_default_audio_name)
+                last_vol = self.get_target_system_volume(self.original_default_audio_name)
                 try:
-                    set_device_endpoint_volume(old_phys_name, self.original_phys_vol)
+                    set_device_endpoint_volume(self.original_default_audio_name, last_vol)
+                except Exception:
+                    pass
+                try:
+                    set_device_endpoint_volume("CABLE Input", 1.0)
                 except Exception:
                     pass
 
-            # 2. 准备新设备物理端点音量
-            self.original_phys_vol = get_device_endpoint_volume(new_phys_name)
-            set_device_endpoint_volume(new_phys_name, 1.0)
-            self.current_live_phys_name = new_phys_name
-            self.original_default_audio_name = new_phys_name
+            # 动态推出并隐藏虚拟声卡 (使其完全从 Windows 任务栏声音输出列表中退出)
+            WindowsAudioPolicyHelper.set_virtual_cable_visibility(visible=False)
 
-            # 3. 安全停止并关闭旧物理输出流
-            old_out_stream = self.live_out_stream
-            self.live_out_stream = None
-            if old_out_stream:
-                try:
-                    old_out_stream.stop_stream()
-                    old_out_stream.close()
-                except Exception:
-                    pass
-
-            # 4. 创建并绑定新物理输出流
-            self.live_out_stream = self.pa.open(
-                format=pyaudio.paFloat32,
-                channels=new_phys_channels,
-                rate=self.live_rate,
-                output=True,
-                output_device_index=new_phys_idx,
-                frames_per_buffer=self.live_chunk_size
-            )
-            self.log(f"✅ 音频输出设备已成功切换为: 【{new_phys_name}】")
+            self.current_live_phys_name = None
+            self.is_live_stopping = False
+            self.sig_set_toggle_state.emit("off")
+            self.sig_set_toggle_status_text.emit("● 未开启 (点击开启)", "#9ca3af")
+            self.sig_set_dsp_tag.emit("● 待机中 (等待开启)", "#71717a" if self.current_theme == "dark" else "#9ca3af")
+            self.log("⏹️ 系统全局声音实时增强已停止，默认播放设备及音量已还原。")
+            self.play_feedback_sound(is_on=False)
         except Exception as e:
-            logging.error(f"Failed to hot-swap output device: {e}")
+            logging.error(f"Stop capture sync error: {e}")
+            self.is_live_stopping = False
+            self.current_live_phys_name = None
+            self.sig_set_toggle_state.emit("off")
+            self.sig_set_dsp_tag.emit("● 待机中", "#71717a" if self.current_theme == "dark" else "#9ca3af")
 
     def toggle_live_capture(self, checked):
-        if self.is_live_capturing:
+        if self.is_live_capturing or getattr(self, 'is_live_starting', False):
+            self.is_live_starting = False
+            self.is_live_stopping = True
             self.sig_set_toggle_state.emit("loading")
             self.sig_set_toggle_status_text.emit("⏳ 正在还原系统声音...", "#f59e0b")
             self.log("⏳ 正在平稳停止系统音频流并还原默认设备...")
-
-            def _async_stop():
-                try:
-                    self.is_live_capturing = False
-                    if self.in_thread and self.in_thread.is_alive():
-                        try: self.in_thread.join(timeout=0.3)
-                        except: pass
-                        self.in_thread = None
-
-                    if self.live_thread and self.live_thread.is_alive():
-                        try: self.live_thread.join(timeout=0.3)
-                        except: pass
-                        self.live_thread = None
-
-                    if self.live_in_stream:
-                        try:
-                            self.live_in_stream.stop_stream()
-                            self.live_in_stream.close()
-                        except: pass
-                        self.live_in_stream = None
-
-                    if self.live_out_stream:
-                        try:
-                            self.live_out_stream.stop_stream()
-                            self.live_out_stream.close()
-                        except: pass
-                        self.live_out_stream = None
-
-                    try:
-                        self.sys_vol_watcher.stop()
-                    except Exception: pass
-
-                    if self.original_default_audio_name:
-                        self.set_windows_default_playback_device(self.original_default_audio_name)
-                        if self.original_phys_vol is not None:
-                            set_device_endpoint_volume(self.original_default_audio_name, self.original_phys_vol)
-
-                    self.current_live_phys_name = None
-                    self.sig_set_toggle_state.emit("off")
-                    self.sig_set_toggle_status_text.emit("● 未开启 (点击开启)", "#9ca3af")
-                    self.sig_set_dsp_tag.emit("● 待机中 (等待开启)", "#71717a" if self.current_theme == "dark" else "#9ca3af")
-                    self.log("⏹️ 系统全局声音实时增强已停止，默认播放设备及音量已还原。")
-                except Exception as e:
-                    logging.error(f"Async stop capture error: {e}")
-                    self.current_live_phys_name = None
-                    self.sig_set_toggle_state.emit("off")
-                    self.sig_set_dsp_tag.emit("● 待机中", "#71717a" if self.current_theme == "dark" else "#9ca3af")
-
-            threading.Thread(target=_async_stop, daemon=True).start()
+            threading.Thread(target=self.stop_live_capture_sync, daemon=True).start()
         else:
             if not self.has_cable_installed:
                 self.sig_show_info.emit("提示", "未检测到虚拟音频通道，请先点击【一键安装驱动】！")
@@ -2387,6 +3103,8 @@ class SodaMusicPlayerQtApp(QMainWindow):
                 self.sig_show_error.emit("错误", "未找到可用的物理耳机/音箱输出设备！")
                 return
 
+            self.is_live_starting = True
+            self.is_live_stopping = False
             self.sig_set_toggle_state.emit("loading")
             self.sig_set_toggle_status_text.emit("⏳ 正在启动增强引擎...", "#f59e0b")
             self.sig_set_dsp_tag.emit("⏳ 正在初始化声卡...", "#f59e0b")
@@ -2394,6 +3112,15 @@ class SodaMusicPlayerQtApp(QMainWindow):
 
             def _async_start():
                 try:
+                    # 动态打开/启用虚拟声卡 (保持 16 通道隐藏，开启 CABLE Input)
+                    WindowsAudioPolicyHelper.set_virtual_cable_visibility(visible=True)
+                    time.sleep(0.08)
+
+                    with self.audio_lock:
+                        try: self.pa.terminate()
+                        except Exception: pass
+                        self.pa = pyaudio.PyAudio()
+
                     cable_in_name = "CABLE Input"
                     cable_out_idx = None
                     cable_out_sr = 48000
@@ -2401,30 +3128,35 @@ class SodaMusicPlayerQtApp(QMainWindow):
 
                     # 优先选择 CABLE Output 捕获原始完整信号 (避免被 Windows 提前二次衰减)
                     for i in range(self.pa.get_device_count()):
-                        dev = self.pa.get_device_info_by_index(i)
-                        host_info = self.pa.get_host_api_info_by_index(dev["hostApi"])
-                        name = dev["name"].lower()
-                        if "wasapi" in host_info["name"].lower():
-                            if ('cable' in name or 'vb-audio' in name) and dev["maxInputChannels"] > 0 and not dev.get("isLoopbackDevice", False):
-                                cable_out_idx = i
-                                cable_out_sr = int(dev["defaultSampleRate"])
-                                cable_out_channels = min(2, dev["maxInputChannels"])
-                                break
-
-                    # 回退机制：若未获取到普通录音通道，则使用 Loopback 通道
-                    if cable_out_idx is None:
-                        for i in range(self.pa.get_device_count()):
+                        try:
                             dev = self.pa.get_device_info_by_index(i)
                             host_info = self.pa.get_host_api_info_by_index(dev["hostApi"])
                             name = dev["name"].lower()
                             if "wasapi" in host_info["name"].lower():
-                                if ('cable' in name or 'vb-audio' in name) and dev["maxInputChannels"] > 0:
+                                if ('cable' in name or 'vb-audio' in name) and dev["maxInputChannels"] > 0 and not dev.get("isLoopbackDevice", False):
                                     cable_out_idx = i
                                     cable_out_sr = int(dev["defaultSampleRate"])
                                     cable_out_channels = min(2, dev["maxInputChannels"])
                                     break
+                        except Exception: pass
+
+                    # 回退机制：若未获取到普通录音通道，则使用 Loopback 通道
+                    if cable_out_idx is None:
+                        for i in range(self.pa.get_device_count()):
+                            try:
+                                dev = self.pa.get_device_info_by_index(i)
+                                host_info = self.pa.get_host_api_info_by_index(dev["hostApi"])
+                                name = dev["name"].lower()
+                                if "wasapi" in host_info["name"].lower():
+                                    if ('cable' in name or 'vb-audio' in name) and dev["maxInputChannels"] > 0:
+                                        cable_out_idx = i
+                                        cable_out_sr = int(dev["defaultSampleRate"])
+                                        cable_out_channels = min(2, dev["maxInputChannels"])
+                                        break
+                            except Exception: pass
 
                     if cable_out_idx is None:
+                        self.is_live_starting = False
                         self.sig_set_toggle_state.emit("off")
                         self.sig_set_dsp_tag.emit("● 待机中", "#71717a")
                         self.sig_show_error.emit("错误", "未找到 CABLE 录音设备，请检查驱动是否正常安装！")
@@ -2439,42 +3171,83 @@ class SodaMusicPlayerQtApp(QMainWindow):
                     phys_out_sr = out_dev_info[2]
                     phys_out_channels = min(2, out_dev_info[3])
 
+                    # 动态精确匹配物理设备在当前最新 PyAudio 实例中的真实 WASAPI 输出索引 (杜绝索引漂移)
+                    for i in range(self.pa.get_device_count()):
+                        try:
+                            d_info = self.pa.get_device_info_by_index(i)
+                            h_info = self.pa.get_host_api_info_by_index(d_info["hostApi"])
+                            if "wasapi" in h_info["name"].lower() and d_info["maxOutputChannels"] > 0 and not d_info.get("isLoopbackDevice", False):
+                                if d_info["name"] == phys_out_name or phys_out_name in d_info["name"]:
+                                    phys_out_idx = i
+                                    phys_out_sr = int(d_info["defaultSampleRate"])
+                                    phys_out_channels = min(2, d_info["maxOutputChannels"])
+                                    break
+                        except Exception: pass
+
                     self.original_default_audio_name = phys_out_name
                     self.current_live_phys_name = phys_out_name
                     self.live_rate = phys_out_sr
                     self.sample_rate = self.live_rate
                     self.live_chunk_size = 1024
+                    self.cable_out_channels = cable_out_channels
+                    self.phys_out_channels = phys_out_channels
 
-                    # 保存物理耳机/音箱原始音量，并将物理设备端点拉满至 100% 满幅，由软件内核与系统音量乘积完全控制
-                    self.original_phys_vol = get_device_endpoint_volume(phys_out_name)
+                    # 动态设定系统音量 (保持用户原选音量在 CABLE Input 上呈现，物理设备设为 1.0 满音量直通)
+                    target_vol = max(0.15, self.get_target_system_volume(phys_out_name))
+                    cur_phys_vol = get_device_endpoint_volume(phys_out_name)
+                    self.original_phys_vol = cur_phys_vol if (cur_phys_vol is not None and cur_phys_vol > 0.05) else target_vol
+                    set_device_endpoint_volume("CABLE Input", target_vol)
                     set_device_endpoint_volume(phys_out_name, 1.0)
+                    set_device_endpoint_volume("CABLE Output", 1.0)
 
                     self.apply_current_effect_to_dsp()
-                    self.set_windows_default_playback_device(cable_in_name)
 
-                    self.live_in_stream = self.pa.open(
-                        format=pyaudio.paFloat32,
-                        channels=cable_out_channels,
-                        rate=self.live_rate,
-                        input=True,
-                        input_device_index=cable_out_idx,
-                        frames_per_buffer=self.live_chunk_size
-                    )
+                    with self.audio_lock:
+                        # 尝试以耳机原生采样率打开，若声卡不支持则以 CABLE 原生采样率打开
+                        try:
+                            self.live_in_stream = self.pa.open(
+                                format=pyaudio.paFloat32,
+                                channels=cable_out_channels,
+                                rate=self.live_rate,
+                                input=True,
+                                input_device_index=cable_out_idx,
+                                frames_per_buffer=self.live_chunk_size
+                            )
+                            self.live_in_sr = self.live_rate
+                        except Exception as open_err:
+                            logging.warning(f"Opening CABLE at {self.live_rate}Hz failed ({open_err}), falling back to {cable_out_sr}Hz")
+                            self.live_in_stream = self.pa.open(
+                                format=pyaudio.paFloat32,
+                                channels=cable_out_channels,
+                                rate=cable_out_sr,
+                                input=True,
+                                input_device_index=cable_out_idx,
+                                frames_per_buffer=int(self.live_chunk_size * (cable_out_sr / self.live_rate))
+                            )
+                            self.live_in_sr = cable_out_sr
 
-                    self.live_out_stream = self.pa.open(
-                        format=pyaudio.paFloat32,
-                        channels=phys_out_channels,
-                        rate=self.live_rate,
-                        output=True,
-                        output_device_index=phys_out_idx,
-                        frames_per_buffer=self.live_chunk_size
-                    )
+                        self.live_out_stream = self.pa.open(
+                            format=pyaudio.paFloat32,
+                            channels=phys_out_channels,
+                            rate=self.live_rate,
+                            output=True,
+                            output_device_index=phys_out_idx,
+                            frames_per_buffer=self.live_chunk_size
+                        )
 
-                    # 启动 Windows 系统主音量实时监听
-                    self.sys_vol_watcher.start()
+                        self.is_live_capturing = True
+                        self.is_live_starting = False
 
-                    self.is_live_capturing = True
                     self.live_ring_buffer = queue.Queue(maxsize=16)
+
+                    # 1. 首先切换 Windows 默认播放设备至 CABLE Input
+                    self.set_windows_default_playback_device(cable_in_name)
+                    time.sleep(0.06)
+
+                    # 2. 启动 Windows 系统主音量实时监听 (此时默认设备已为 CABLE Input，完美挂接)
+                    self.sys_vol_watcher.sys_vol = target_vol
+                    self.sys_vol_watcher.set_phys_device(phys_out_name)
+                    self.sys_vol_watcher.start()
 
                     self.in_thread = threading.Thread(target=self._in_capture_and_dsp_worker, daemon=True)
                     self.in_thread.start()
@@ -2486,9 +3259,11 @@ class SodaMusicPlayerQtApp(QMainWindow):
                     self.sig_set_toggle_status_text.emit("● 实时增强运行中 (已接管)", "#34d399")
                     self.sig_set_dsp_tag.emit(f"● {self.live_rate // 1000}kHz 实时调音运行中", "#34d399" if self.current_theme == "dark" else "#059669")
                     self.log("🎙️ 系统全局声音实时增强已成功启动！")
+                    self.play_feedback_sound(is_on=True)
                 except Exception as e:
                     logging.error(f"Failed to start live capture: {e}")
                     self.is_live_capturing = False
+                    self.is_live_starting = False
                     self.current_live_phys_name = None
                     self.sig_set_toggle_state.emit("off")
                     self.sig_set_toggle_status_text.emit("● 启动失败", "#ef4444")
@@ -2499,13 +3274,46 @@ class SodaMusicPlayerQtApp(QMainWindow):
 
             threading.Thread(target=_async_start, daemon=True).start()
 
+    def _compute_fft_bands_cached(self, sample_data):
+        """向量化且预缓存的高性能 72 频段声学分析 (零重复内存分配)"""
+        n_samples = len(sample_data)
+        if not hasattr(self, '_fft_cache_size') or self._fft_cache_size != n_samples:
+            self._fft_cache_size = n_samples
+            self._fft_hanning = np.hanning(n_samples).astype(np.float32)
+            sr = getattr(self, 'live_rate', 48000)
+            bin_hz = sr / float(n_samples)
+            log_freqs = np.geomspace(30, min(18000, sr / 2.1), 73)
+            self._fft_bin_ranges = []
+            for bi in range(72):
+                f0 = log_freqs[bi]
+                f1 = log_freqs[bi + 1]
+                a = max(1, int(math.floor(f0 / bin_hz)))
+                b = min(n_samples // 2, int(math.ceil(f1 / bin_hz)))
+                self._fft_bin_ranges.append((a, b))
+
+        fft_data = np.abs(np.fft.rfft(sample_data * self._fft_hanning))
+        self.fft_raw_spectrum = fft_data
+
+        bands_72 = np.zeros(72, dtype=np.float32)
+        fft_len = len(fft_data)
+        for bi, (a, b) in enumerate(self._fft_bin_ranges):
+            if b >= a and b < fft_len:
+                chunk = fft_data[a:b+1]
+                bands_72[bi] = float(np.sqrt(np.mean(chunk ** 2)))
+            elif a < fft_len:
+                bands_72[bi] = float(fft_data[a])
+        return bands_72
+
     def _in_capture_and_dsp_worker(self):
         logging.info("Entering Ingest-DSP live_capture_worker...")
+        in_consecutive_errors = 0
         while self.is_live_capturing:
             try:
-                if not self.live_in_stream:
-                    break
-                data = self.live_in_stream.read(self.live_chunk_size, exception_on_overflow=False)
+                stream = self.live_in_stream
+                if not stream:
+                    time.sleep(0.01)
+                    continue
+                data = stream.read(self.live_chunk_size, exception_on_overflow=False)
                 if not data:
                     time.sleep(0.001)
                     continue
@@ -2513,41 +3321,53 @@ class SodaMusicPlayerQtApp(QMainWindow):
                 floats = np.frombuffer(data, dtype=np.float32).copy()
                 if len(floats) == 0:
                     continue
+                c_ch = getattr(self, 'cable_out_channels', 2)
                 if floats.ndim == 1:
-                    floats = floats.reshape(-1, 2)
+                    floats = floats.reshape(-1, min(2, max(1, c_ch)))
+                if floats.shape[1] == 1:
+                    floats = np.column_stack([floats, floats])
                 if len(floats) == 0:
                     continue
 
+                in_consecutive_errors = 0
+
+                # 采样率对齐 (如 CABLE 原生 44100Hz -> 物理耳机 48000Hz)
+                cur_in_sr = getattr(self, 'live_in_sr', self.live_rate)
+                if cur_in_sr != self.live_rate:
+                    floats = resample_audio_chunk(floats, cur_in_sr, self.live_rate)
+
                 sample_data = floats[:, 0]
-                fft_data = np.abs(np.fft.rfft(sample_data * np.hanning(len(sample_data))))
-                self.fft_raw_spectrum = fft_data
-                # 72 频段对数声学分布 (30Hz ~ 18000Hz)
-                if len(fft_data) > 16:
-                    sr = getattr(self, 'live_in_sr', 48000)
-                    fft_size = len(sample_data)
-                    bin_hz = sr / float(fft_size)
-                    log_freqs = np.geomspace(30, min(18000, sr / 2.1), 73)
-                    bands_72 = np.zeros(72, dtype=np.float32)
-                    for bi in range(72):
-                        f0 = log_freqs[bi]
-                        f1 = log_freqs[bi + 1]
-                        a = max(1, int(math.floor(f0 / bin_hz)))
-                        b = min(len(fft_data) - 1, int(math.ceil(f1 / bin_hz)))
-                        if b >= a:
-                            chunk = fft_data[a:b+1]
-                            bands_72[bi] = float(np.sqrt(np.mean(chunk ** 2)))
-                        elif a < len(fft_data):
-                            bands_72[bi] = float(fft_data[a])
-                    self.fft_magnitudes = bands_72
+                if len(sample_data) > 16:
+                    self.fft_magnitudes = self._compute_fft_bands_cached(sample_data)
 
                 processed = self.dsp_client.process_chunk(floats)
 
-                # 完美结合 Windows 系统主音量与软件内增益滑块
-                sys_factor = 0.0 if self.sys_vol_watcher.sys_muted else self.sys_vol_watcher.sys_vol
-                effective_vol = self.volume * sys_factor
-                out = processed * effective_vol
-                if effective_vol > 1.0:
-                    apply_studio_soft_limiter(out)
+                # 软件内增益滑块与系统音量精准叠加计算 (包含系统与软件双重静音判断)
+                is_sys_muted = getattr(self.sys_vol_watcher, 'sys_muted', False)
+                is_app_muted = getattr(self, 'is_muted', False)
+
+                if is_app_muted or is_sys_muted:
+                    target_gain = 0.0
+                else:
+                    sys_vol = getattr(self.sys_vol_watcher, 'sys_vol', 1.0)
+                    soft_vol = getattr(self, 'volume', 1.0)
+                    # 系统音量 (0.0~1.0) 与 软件音量 (0.0~2.0) 叠加
+                    target_gain = max(0.0, float(sys_vol) * float(soft_vol))
+
+                # 动态一阶平滑滤波器 (平滑过渡约 15~20ms)，彻底杜绝调音拉链杂音与突变爆音
+                if not hasattr(self, '_smoothed_gain'):
+                    self._smoothed_gain = target_gain
+                else:
+                    self._smoothed_gain = self._smoothed_gain * 0.75 + target_gain * 0.25
+                    if abs(self._smoothed_gain - target_gain) < 0.001:
+                        self._smoothed_gain = target_gain
+
+                if self._smoothed_gain <= 0.0001:
+                    out = np.zeros_like(processed)
+                else:
+                    out = processed * self._smoothed_gain
+                    if self._smoothed_gain > 1.0 or np.any(np.abs(out) > 0.85):
+                        apply_studio_soft_limiter(out)
 
                 out_bytes = out.astype(np.float32).tobytes()
 
@@ -2562,8 +3382,10 @@ class SodaMusicPlayerQtApp(QMainWindow):
             except Exception as e:
                 if not self.is_live_capturing:
                     break
-                logging.error(f"Live Ingest Worker Exception: {e}")
-                time.sleep(0.01)
+                in_consecutive_errors += 1
+                if in_consecutive_errors % 25 == 1:
+                    logging.error(f"Live Ingest Worker Exception ({in_consecutive_errors}): {e}")
+                time.sleep(0.05)
 
     def _out_playback_worker(self):
         logging.info("Entering Out-Playback live_capture_worker...")
@@ -2572,7 +3394,7 @@ class SodaMusicPlayerQtApp(QMainWindow):
             try:
                 stream = self.live_out_stream
                 if not stream:
-                    time.sleep(0.01)
+                    time.sleep(0.02)
                     continue
                 try:
                     chunk_bytes = self.live_ring_buffer.get(timeout=0.05)
@@ -2585,13 +3407,12 @@ class SodaMusicPlayerQtApp(QMainWindow):
                 if not self.is_live_capturing:
                     break
                 consecutive_errors += 1
-                logging.error(f"Live Out Playback Worker Exception ({consecutive_errors}): {e}")
-                if consecutive_errors >= 3:
-                    # 设备可能已拔出/断开，触发信号自动恢复切换
-                    self.sig_audio_devices_changed.emit()
-                    time.sleep(0.1)
-                else:
-                    time.sleep(0.01)
+                if consecutive_errors % 25 == 1:
+                    logging.error(f"Live Out Playback Worker Exception ({consecutive_errors}): {e}")
+                # 当物理设备断开或流异常，置空当前输出流并请求重新自愈与设备切换
+                self.live_out_stream = None
+                self._recover_live_streams()
+                time.sleep(0.05)
 
     def on_volume_change(self, val):
         self.volume = val / 100.0
@@ -2606,6 +3427,18 @@ class SodaMusicPlayerQtApp(QMainWindow):
         self.vol_badge.setStyleSheet(f"background-color: {bg_col}; border: 1px solid {border_col}; border-radius: 6px; padding: 4px 6px; color: {vol_color}; font-family: Consolas; font-weight: bold;")
         self.user_cfg["volume"] = val
         self.save_user_config()
+
+        # 实时刷新音量悬浮提示与叠加总音量展示
+        try:
+            sys_vol = getattr(self.sys_vol_watcher, 'sys_vol', 0.5)
+            sys_pct = int(round(float(sys_vol) * 100))
+            total_pct = int(round((val * sys_pct) / 100.0))
+            tip = f"软件音量: {val}%  |  系统音量: {sys_pct}%\n★ 实时叠加总音量: {total_pct}%"
+            self.vol_badge.setToolTip(tip)
+            if hasattr(self, 'vol_slider'):
+                self.vol_slider.setToolTip(tip)
+        except Exception:
+            pass
 
     def toggle_mute(self):
         if self.is_muted:
@@ -2677,44 +3510,244 @@ class SodaMusicPlayerQtApp(QMainWindow):
         else:
             super().keyPressEvent(event)
 
+    def activate_window_to_top(self):
+        """激活并唤醒当前窗口至 Windows 最前端 (解决多开、托盘唤醒及最小化置顶)"""
+        try:
+            self.showNormal()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            if sys.platform == 'win32':
+                hwnd = int(self.winId())
+                if hwnd != 0:
+                    ctypes.windll.user32.ShowWindow(hwnd, 9)  # 9 = SW_RESTORE
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception as e:
+            logging.warning(f"Error activating window to top: {e}")
+
+    def init_tray_icon(self):
+        """初始化系统托盘图标与右键快捷菜单"""
+        try:
+            self.tray_icon = QSystemTrayIcon(self)
+            if os.path.exists(ICON_PATH):
+                self.tray_icon.setIcon(QIcon(ICON_PATH))
+            elif os.path.exists(PNG_PATH):
+                self.tray_icon.setIcon(QIcon(PNG_PATH))
+            else:
+                self.tray_icon.setIcon(self.windowIcon())
+
+            self.tray_icon.setToolTip("音效管理 - 全局音频实时增强")
+
+            tray_menu = QMenu()
+            tray_menu.setStyleSheet("""
+                QMenu {
+                    background-color: #1e1e24;
+                    color: #ffffff;
+                    border: 1px solid #2f2f3c;
+                    border-radius: 8px;
+                    padding: 6px;
+                    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+                    font-size: 13px;
+                }
+                QMenu::item {
+                    padding: 6px 22px 6px 12px;
+                    border-radius: 4px;
+                }
+                QMenu::item:selected {
+                    background-color: #3b82f6;
+                    color: #ffffff;
+                }
+                QMenu::separator {
+                    height: 1px;
+                    background-color: #2f2f3c;
+                    margin: 4px 0px;
+                }
+            """)
+
+            act_show = QAction("🎵 显示主界面", self)
+            act_show.triggered.connect(self.activate_window_to_top)
+            tray_menu.addAction(act_show)
+
+            tray_menu.addSeparator()
+
+            act_quit = QAction("❌ 退出软件", self)
+            act_quit.triggered.connect(self.force_exit_app)
+            tray_menu.addAction(act_quit)
+
+            self.tray_icon.setContextMenu(tray_menu)
+            self.tray_icon.activated.connect(self._on_tray_activated)
+            self.tray_icon.show()
+        except Exception as tray_err:
+            logging.warning(f"Failed to initialize system tray icon: {tray_err}")
+
+    def _on_tray_activated(self, reason):
+        """托盘图标点击/双击激活窗口"""
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            if self.isVisible() and not self.isMinimized() and self.isActiveWindow():
+                self.hide()
+            else:
+                self.activate_window_to_top()
+
+    def force_exit_app(self):
+        """由系统托盘右键菜单真正彻底退出程序"""
+        self.is_really_quitting = True
+        if hasattr(self, 'tray_icon'):
+            try: self.tray_icon.hide()
+            except Exception: pass
+        self.close()
+        QApplication.instance().quit()
+
     def closeEvent(self, event):
-        logging.info("Closing application...")
+        # 若用户点击右上角 [X]，则拦截关闭并平滑隐藏至后台系统托盘
+        if not getattr(self, 'is_really_quitting', False):
+            event.ignore()
+            self.hide()
+            if not getattr(self, 'tray_tip_shown', False):
+                self.tray_tip_shown = True
+                if hasattr(self, 'tray_icon') and self.tray_icon.isSystemTrayAvailable():
+                    self.tray_icon.showMessage(
+                        "音效管理",
+                        "软件已隐藏至系统托盘，实时音效继续生效中。\n点击托盘图标可重新打开主界面，右键可退出软件。",
+                        QSystemTrayIcon.MessageIcon.Information,
+                        2500
+                    )
+            logging.info("Window close intercepted -> minimized/hidden to Windows system tray.")
+            return
+
+        logging.info("Closing application completely...")
         try:
-            if hasattr(self, 'device_watcher') and self.device_watcher:
-                self.device_watcher.stop()
-        except Exception:
-            pass
-        try:
+            if hasattr(self, 'visualizer_timer'):
+                self.visualizer_timer.stop()
             if hasattr(self, 'device_poll_timer'):
                 self.device_poll_timer.stop()
             if hasattr(self, 'device_debounce_timer'):
                 self.device_debounce_timer.stop()
+            if hasattr(self, 'device_watcher') and self.device_watcher:
+                self.device_watcher.stop()
         except Exception:
             pass
+
         try:
             self.sys_vol_watcher.stop()
         except Exception:
             pass
-        if self.is_live_capturing:
-            self.toggle_live_capture(False)
-        try:
-            self.pa.terminate()
-        except Exception:
-            pass
-        if self.dsp_process:
+
+        # 同步平稳停止系统音频流并还原 Windows 默认设备和物理音量 (关键：必须同步完成以防进程提前退出)
+        if self.is_live_capturing or getattr(self, 'is_live_starting', False):
+            self.stop_live_capture_sync()
+        elif self.original_default_audio_name:
+            self.set_windows_default_playback_device(self.original_default_audio_name)
+            last_vol = self.get_target_system_volume(self.original_default_audio_name)
             try:
-                self.dsp_process.terminate()
+                set_device_endpoint_volume(self.original_default_audio_name, last_vol)
             except Exception:
                 pass
+            try:
+                set_device_endpoint_volume("CABLE Input", 1.0)
+            except Exception:
+                pass
+
+        # 退出时确保虚拟声卡完全隐藏
+        try:
+            WindowsAudioPolicyHelper.set_virtual_cable_visibility(visible=False)
+        except Exception:
+            pass
+
+        try:
+            with self.audio_lock:
+                self.pa.terminate()
+        except Exception:
+            pass
+
+        if self.dsp_process:
+            try:
+                # 强杀 DSP Node.js 进程树，杜绝后台死进程残留
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(self.dsp_process.pid)],
+                    capture_output=True,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+                )
+            except Exception:
+                try: self.dsp_process.terminate()
+                except Exception: pass
+
         event.accept()
+
+def check_single_instance(server_name="soda_audio_effect_single_instance_ipc"):
+    """
+    Windows 全局单实例守护锁：
+    若检测到已有实例运行，发送 ACTIVATE 信号唤醒已有窗口并立即退出当前重复进程；
+    若为首个实例，则开启本地 IPC 监听服务。
+    """
+    socket = QLocalSocket()
+    socket.connectToServer(server_name)
+    if socket.waitForConnected(500):
+        logging.info("检测到已存在运行中的【音效管理】实例，正在唤醒前台窗口并退出重复进程...")
+        socket.write(b"ACTIVATE")
+        socket.waitForBytesWritten(500)
+        socket.disconnectFromServer()
+        if sys.platform == 'win32':
+            try:
+                hwnd = ctypes.windll.user32.FindWindowW(None, "音效管理")
+                if hwnd != 0:
+                    ctypes.windll.user32.ShowWindow(hwnd, 9)
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        return None
+
+    local_server = QLocalServer()
+    QLocalServer.removeServer(server_name)
+    local_server.listen(server_name)
+    return local_server
 
 def main():
     logging.info("=" * 60)
     logging.info("音效管理系统 (Qt6 旗舰版) 启动 / Qt6 Application Started")
     app = QApplication(sys.argv)
+
+    # 启用全局深色调色板 (从第 0 帧杜绝默认白色画布闪现)
+    app.setStyle("Fusion")
+    dark_pal = QPalette()
+    dark_pal.setColor(QPalette.ColorRole.Window, QColor("#121216"))
+    dark_pal.setColor(QPalette.ColorRole.WindowText, QColor("#ffffff"))
+    dark_pal.setColor(QPalette.ColorRole.Base, QColor("#18181f"))
+    dark_pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#22222b"))
+    dark_pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#121216"))
+    dark_pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#ffffff"))
+    dark_pal.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
+    dark_pal.setColor(QPalette.ColorRole.Button, QColor("#1e1e24"))
+    dark_pal.setColor(QPalette.ColorRole.ButtonText, QColor("#ffffff"))
+    dark_pal.setColor(QPalette.ColorRole.BrightText, QColor("#ef4444"))
+    dark_pal.setColor(QPalette.ColorRole.Highlight, QColor("#3b82f6"))
+    dark_pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    app.setPalette(dark_pal)
+
+    server_name = "soda_audio_effect_single_instance_ipc"
+    local_server = check_single_instance(server_name)
+    if local_server is None:
+        sys.exit(0)
+
     window = SodaMusicPlayerQtApp()
+    window.ensurePolished()
+
+    def _on_new_instance():
+        client_sock = local_server.nextPendingConnection()
+        if client_sock:
+            client_sock.readyRead.connect(window.activate_window_to_top)
+            window.activate_window_to_top()
+
+    local_server.newConnection.connect(_on_new_instance)
+
     window.show()
-    sys.exit(app.exec())
+    window.activate_window_to_top()
+    exit_code = app.exec()
+    try:
+        local_server.close()
+        QLocalServer.removeServer(server_name)
+    except Exception:
+        pass
+    sys.exit(exit_code)
 
 if __name__ == '__main__':
     main()
