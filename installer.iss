@@ -1,12 +1,12 @@
-﻿; Inno Setup Script for Soda Audio Effect Manager
+; Inno Setup Script for Soda Audio Effect Manager
 ; 建议使用 Inno Setup 6.x 编译
 
 #define MyAppName "音效管理"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "Soda Audio Effect Studio"
 #define MyAppURL "https://github.com/Zlq123456789/soda_audio_effect_module"
 #define MyAppExeName "音效管理.exe"
-#define MyAppSourceDir "release_v1.0.0\音效管理_v1.0.0_免安装绿色版"
+#define MyAppSourceDir "release_v1.0.1\音效管理_v1.0.1_免安装绿色版"
 
 [Setup]
 ; App Details
@@ -23,8 +23,8 @@ DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ; Output
-OutputDir=release_v1.0.0
-OutputBaseFilename=Soda_Audio_Effect_v1.0.0_Setup
+OutputDir=release_v1.0.1
+OutputBaseFilename=Soda_Audio_Effect_v1.0.1_Setup
 SetupIconFile=app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64

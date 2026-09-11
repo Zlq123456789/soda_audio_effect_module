@@ -1,8 +1,8 @@
-# 🎵 音效管理 & 全局系统音频增强器 (v1.0.0 旗舰硬件加速版)
+# 🎵 音效管理 & 全局系统音频增强器 (v1.0.1 旗舰硬件加速版)
 
 > **基于 100% 官方原版 WebAssembly DSP 调音内核 与 Qt6 硬件加速图形界面打造的 Windows 全局音频音效增强系统**
 
-[![Release](https://img.shields.io/badge/Release-v1.0.0-blue.svg)](https://github.com/Zlq123456789/soda_audio_effect_module/releases)
+[![Release](https://img.shields.io/badge/Release-v1.0.1-blue.svg)](https://github.com/Zlq123456789/soda_audio_effect_module/releases)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20x64-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)]()
 [![License](https://img.shields.io/badge/License-Non--Commercial-red.svg)]()
@@ -53,8 +53,8 @@
 
 ### 1. 下载即用
 从 [Releases 页面](https://github.com/Zlq123456789/soda_audio_effect_module/releases) 下载最新发行包：
-- **Soda_Audio_Effect_v1.0.0_Portable.zip**（免安装绿色版，推荐，解压即用，零启动延迟）
-- **Soda_Audio_Effect_v1.0.0_Standalone_EXE.zip**（单文件独立 EXE 版）
+- **Soda_Audio_Effect_v1.0.1_Portable.zip**（免安装绿色版，推荐，解压即用，零启动延迟）
+- **Soda_Audio_Effect_v1.0.1_Setup.exe**（安装版安装包）
 
 ### 2. 运行与接管
 1. 解压后双击运行 **音效管理.exe**。
@@ -66,7 +66,7 @@
 
 ## 🛠️ 项目架构
 
-`
+```
 soda_audio_effect_module/
 ├── presets/                 # 9 大官方音效 DSP 配置文件
 ├── tools/                   # 内置工具 (vbcable 虚拟声卡 / nircmd 系统声卡控制)
@@ -75,8 +75,8 @@ soda_audio_effect_module/
 ├── soda_player_gui_qt.py    # Qt6 旗舰版主界面与音频管理流引擎
 ├── dsp_server.mjs           # 本地高性能二进制 DSP TCP 调音服务端
 ├── config.json              # 用户持久化配置
-└── release_v1.0.0/          # 发布包产物
-`
+└── release_v1.0.1/          # 发布包产物
+```
 
 ---
 
